@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# CPU Fault Isolation (CFI) kernel module
+#
+
+obj-m += cpu_fault_isolate.o
+
+# Core components (architecture-independent)
+cpu_fault_isolate-y := core/cfi_main.o \
+		       core/cfi_core.o \
+		       core/cfi_hotplug.o \
+		       core/cfi_netlink.o \
+		       core/cfi_sysfs.o \
+		       core/cfi_debugfs.o
+
+# Architecture-specific backends
+cpu_fault_isolate-$(CONFIG_X86)   += arch/x86/cfi_x86.o \
+				     arch/x86/cfi_x86_cache.o
+cpu_fault_isolate-$(CONFIG_ARM64) += arch/arm64/cfi_arm64.o \
+				     arch/arm64/cfi_arm64_cache.o
+
+ccflags-y := -I$(src)/include

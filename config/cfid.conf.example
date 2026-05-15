@@ -1,0 +1,77 @@
+# CPU Fault Isolation Daemon (cfid) Configuration
+# /etc/cfid/cfid.conf
+
+[general]
+# Log level: debug, info, warn, error
+log_level = info
+
+# SQLite database path for persistent error logging
+db_path = /var/lib/cfid/errors.db
+
+# PID file
+pid_file = /var/run/cfid.pid
+
+[policy]
+# Per-error-type corrected error thresholds (overrides kernel default)
+# These take effect when the daemon is running and connected.
+l1_cache_ce_threshold = 20
+l2_cache_ce_threshold = 10
+l3_cache_ce_threshold = 5
+
+# Uncorrected error threshold (any type)
+core_uce_threshold = 1
+
+# Time window for error counting (seconds)
+window_secs = 3600
+
+# Exponential backoff on recurrence:
+# If a CPU was recently unisolated and errors recur, halve the threshold.
+recurrence_multiplier = 0.5
+max_recurrences = 3
+
+# Minimum time a CPU must stay isolated before unisolation (seconds)
+min_isolation_secs = 300
+
+# Never isolate the last N CPUs on a NUMA node
+min_cpus_per_node = 2
+
+# Protect boot CPU (cpu0) from automatic isolation
+protect_boot_cpu = true
+
+# If more than N cores on same socket are degraded, raise socket alert
+socket_degrade_alert_count = 4
+
+# Whether to isolate SMT siblings when a core is isolated (x86 only)
+isolate_smt_sibling = true
+
+[vm]
+# Enable VM-aware isolation (requires libvirt)
+enabled = true
+
+# Prefer same-NUMA-node vCPU migration
+prefer_numa_local = true
+
+# Webhook URL to notify orchestrator (OpenStack Nova / Kubernetes)
+# for triggering VM live migration at cluster level.
+# Leave empty to disable.
+orchestrator_webhook =
+
+# QMP socket path pattern for direct QEMU communication
+# %d is replaced with the QEMU process PID
+# qmp_socket_pattern = /var/run/libvirt/qemu/%s.monitor
+
+[alert]
+# syslog facility
+syslog_facility = daemon
+
+# Structured JSON event log
+json_log_path = /var/log/cfid/events.json
+
+# Webhook URL for external alerting (Prometheus Alertmanager, Zabbix, etc.)
+# POST with JSON body on each isolation/degradation event.
+# Leave empty to disable.
+alert_webhook =
+
+# SNMP trap destination (host:port)
+# Leave empty to disable.
+snmp_trap_dest =

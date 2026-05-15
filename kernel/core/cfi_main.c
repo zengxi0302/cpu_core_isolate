@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * CPU Fault Isolation (CFI) - Module Entry Point
+ *
+ * Initializes the CFI subsystem: allocates per-CPU tracking structures,
+ * registers the architecture-specific error backend, and sets up
+ * netlink and sysfs interfaces.
+ *
+ * Copyright (c) 2026 openEuler Community
+ */
+
+#define pr_fmt(fmt) CFI_MODULE_NAME ": " fmt
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/cpu.h>
+#include <linux/cpumask.h>
+#include "cfi_internal.h"
+
+/* --- Module parameters --- */
+
+unsigned int cfi_ce_threshold = 10;
+module_param_named(ce_threshold, cfi_ce_threshold, uint, 0644);
+MODULE_PARM_DESC(ce_threshold,
+	"Corrected errors per window to enter DEGRADED state (default: 10)");
+
+unsigned int cfi_uce_threshold = 1;
+module_param_named(uce_threshold, cfi_uce_threshold, uint, 0644);
+MODULE_PARM_DESC(uce_threshold,
+	"Uncorrected errors per window to trigger isolation (default: 1)");
+
+unsigned int cfi_window_secs = 3600;
+module_param_named(window_secs, cfi_window_secs, uint, 0644);
+MODULE_PARM_DESC(window_secs,
+	"Error counting window duration in seconds (default: 3600)");
+
+bool cfi_auto_isolate = true;
+module_param_named(auto_isolate, cfi_auto_isolate, bool, 0644);
+MODULE_PARM_DESC(auto_isolate,
+	"Automatically offline CPUs that exceed error threshold (default: Y)");
+
+bool cfi_defer_to_daemon = true;
+module_param_named(defer_to_daemon, cfi_defer_to_daemon, bool, 0644);
+MODULE_PARM_DESC(defer_to_daemon,
+	"Wait for userspace daemon ACK before CPU offline (default: Y)");
+
+unsigned int cfi_defer_timeout_ms = 30000;
+module_param_named(defer_timeout_ms, cfi_defer_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(defer_timeout_ms,
+	"Max time to wait for daemon ACK in milliseconds (default: 30000)");
+
+/* --- Global state --- */
+
+struct cfi_cpu_info *cfi_cpus;
+const struct cfi_arch_ops *cfi_arch;
+
+/*
+ * Initialize per-CPU tracking structures for all possible CPUs.
+ */
+static int cfi_alloc_cpus(void)
+{
+	unsigned int cpu;
+
+	cfi_cpus = kvcalloc(nr_cpu_ids, sizeof(*cfi_cpus), GFP_KERNEL);
+	if (!cfi_cpus)
+		return -ENOMEM;
+
+	for_each_possible_cpu(cpu) {
+		struct cfi_cpu_info *ci = &cfi_cpus[cpu];
+
+		spin_lock_init(&ci->lock);
+		ci->state = cpu_online(cpu) ? CFI_STATE_ONLINE : CFI_STATE_ISOLATED;
+		ci->window_start_ns = ktime_get_ns();
+		INIT_LIST_HEAD(&ci->error_log);
+		INIT_WORK(&ci->offline_work, cfi_offline_work_fn);
+		timer_setup(&ci->defer_timer, cfi_defer_timer_fn, 0);
+	}
+
+	return 0;
+}
+
+static void cfi_free_cpus(void)
+{
+	unsigned int cpu;
+
+	if (!cfi_cpus)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		struct cfi_cpu_info *ci = &cfi_cpus[cpu];
+		struct cfi_error_log_entry *entry, *tmp;
+
+		cancel_work_sync(&ci->offline_work);
+		del_timer_sync(&ci->defer_timer);
+
+		list_for_each_entry_safe(entry, tmp, &ci->error_log, list) {
+			list_del(&entry->list);
+			kfree(entry);
+		}
+	}
+
+	kvfree(cfi_cpus);
+	cfi_cpus = NULL;
+}
+
+static int __init cfi_init(void)
+{
+	int ret;
+
+	pr_info("initializing (ce_thresh=%u uce_thresh=%u window=%us)\n",
+		cfi_ce_threshold, cfi_uce_threshold, cfi_window_secs);
+
+	ret = cfi_alloc_cpus();
+	if (ret) {
+		pr_err("failed to allocate per-CPU structures: %d\n", ret);
+		return ret;
+	}
+
+	ret = cfi_netlink_init();
+	if (ret) {
+		pr_err("failed to register netlink family: %d\n", ret);
+		goto err_free_cpus;
+	}
+
+	ret = cfi_sysfs_init();
+	if (ret) {
+		pr_err("failed to create sysfs entries: %d\n", ret);
+		goto err_netlink;
+	}
+
+	ret = cfi_hotplug_init();
+	if (ret) {
+		pr_err("failed to register hotplug callbacks: %d\n", ret);
+		goto err_sysfs;
+	}
+
+	/* debugfs inject interface (non-fatal if it fails) */
+	cfi_debugfs_init();
+
+	/* Select and initialize architecture backend */
+#ifdef CONFIG_X86
+	cfi_arch = &cfi_x86_ops;
+#elif defined(CONFIG_ARM64)
+	cfi_arch = &cfi_arm64_ops;
+#else
+	pr_err("unsupported architecture\n");
+	ret = -ENODEV;
+	goto err_debugfs;
+#endif
+
+	if (cfi_arch->init) {
+		ret = cfi_arch->init();
+		if (ret) {
+			pr_err("arch backend init failed: %d\n", ret);
+			cfi_arch = NULL;
+			goto err_debugfs;
+		}
+	}
+
+	pr_info("initialized successfully\n");
+	return 0;
+
+#if !defined(CONFIG_X86) && !defined(CONFIG_ARM64)
+err_debugfs:
+	cfi_debugfs_exit();
+	cfi_hotplug_exit();
+#endif
+err_sysfs:
+	cfi_sysfs_exit();
+err_netlink:
+	cfi_netlink_exit();
+err_free_cpus:
+	cfi_free_cpus();
+	return ret;
+}
+
+static void __exit cfi_exit(void)
+{
+	pr_info("unloading\n");
+
+	if (cfi_arch && cfi_arch->exit)
+		cfi_arch->exit();
+	cfi_arch = NULL;
+
+	cfi_debugfs_exit();
+	cfi_hotplug_exit();
+	cfi_sysfs_exit();
+	cfi_netlink_exit();
+	cfi_free_cpus();
+
+	pr_info("unloaded\n");
+}
+
+module_init(cfi_init);
+module_exit(cfi_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("openEuler Community");
+MODULE_DESCRIPTION("CPU Core/Cache Fault Isolation for improved system reliability");
+MODULE_VERSION("0.1.0");

@@ -1,0 +1,28 @@
+[Unit]
+Description=CPU Fault Isolation Daemon
+Documentation=man:cfid(8)
+After=network.target syslog.target
+Wants=cpu_fault_isolate.service
+ConditionPathExists=/etc/cfid/cfid.conf
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/cfid -c /etc/cfid/cfid.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+ProtectSystem=strict
+ReadWritePaths=/var/lib/cfid /var/log/cfid /var/run
+ProtectHome=yes
+NoNewPrivileges=no
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_ADMIN
+
+# Resource limits
+LimitNOFILE=1024
+LimitMEMLOCK=64M
+
+[Install]
+WantedBy=multi-user.target
