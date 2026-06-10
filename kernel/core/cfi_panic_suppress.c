@@ -11,8 +11,16 @@
  *   - hardlockup_panic: kernel would panic on hardlockup
  *   - MCE tolerant level: kernel would panic on fatal MCE
  *
- * Also registers a panic notifier as a last-resort logger in case
- * a panic still occurs (e.g., from a source we don't suppress).
+ * MCE tolerant setting strategy (two methods):
+ *   Method 1: Write to /sys/.../tolerant sysfs (standard upstream kernels)
+ *   Method 2: Direct kernel variable write via kprobe symbol lookup
+ *             (fallback for HCE3/openEuler kernels that removed sysfs)
+ *
+ * HCE3 (Huawei Cloud EulerOS 3.0) adaptation:
+ *   - Registers on mce_panic_chain (notify_mce_panic) as last-resort
+ *     pre-panic logger, since HCE3 calls this before mce_panic().
+ *
+ * Also registers a generic panic notifier as a last-resort logger.
  */
 
 #define pr_fmt(fmt) CFI_MODULE_NAME ": " fmt
@@ -21,6 +29,7 @@
 #include <linux/notifier.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
+#include <linux/kprobes.h>
 #include "cfi_internal.h"
 
 #define PROC_SOFTLOCKUP_PANIC	"/proc/sys/kernel/softlockup_panic"
@@ -30,6 +39,17 @@
 static int orig_softlockup_panic = -1;
 static int orig_hardlockup_panic = -1;
 static int orig_mce_tolerant = -1;
+
+/*
+ * Pointer to in-kernel mce_tolerant variable, found via kprobe lookup.
+ * Used as fallback when sysfs interface is unavailable (HCE3 kernels).
+ */
+static int *mce_tolerant_ptr;
+
+/*
+ * Whether we registered on HCE3's mce_panic_chain.
+ */
+static bool hce3_panic_chain_registered;
 
 static int cfi_read_int_file(const char *path, int *value)
 {
@@ -71,6 +91,63 @@ static int cfi_write_int_file(const char *path, int value)
 	return (ret == len) ? 0 : -EIO;
 }
 
+/*
+ * Use kprobe to look up a kernel symbol address.
+ * kallsyms_lookup_name() is not exported to modules since 5.7,
+ * but we can register a kprobe on the symbol to get its address.
+ */
+static unsigned long cfi_lookup_name(const char *name)
+{
+	struct kprobe kp = {};
+	unsigned long addr;
+
+	kp.symbol_name = name;
+	if (register_kprobe(&kp) < 0)
+		return 0;
+	addr = (unsigned long)kp.addr;
+	unregister_kprobe(&kp);
+	return addr;
+}
+
+/*
+ * Directly set the in-kernel mce_tolerant variable.
+ * Fallback for kernels without tolerant sysfs (HCE3).
+ */
+static int cfi_set_tolerant_direct(unsigned int target)
+{
+	unsigned long addr;
+
+	addr = cfi_lookup_name("mce_tolerant");
+	if (!addr) {
+		/* HCE3 may rename: try tolerant_config or other variants */
+		addr = cfi_lookup_name("tolerant");
+		if (!addr)
+			return -ENOENT;
+	}
+
+	mce_tolerant_ptr = (int *)addr;
+	orig_mce_tolerant = *mce_tolerant_ptr;
+
+	if (orig_mce_tolerant < (int)target) {
+		*mce_tolerant_ptr = (int)target;
+		pr_info("set mce_tolerant=%u directly via kallsyms (was %d)\n",
+			target, orig_mce_tolerant);
+	} else {
+		pr_info("mce_tolerant already >= %u (current: %d)\n",
+			target, orig_mce_tolerant);
+	}
+	return 0;
+}
+
+static void cfi_restore_tolerant_direct(void)
+{
+	if (mce_tolerant_ptr && orig_mce_tolerant >= 0) {
+		*mce_tolerant_ptr = orig_mce_tolerant;
+		pr_info("restored mce_tolerant=%d directly\n",
+			orig_mce_tolerant);
+	}
+}
+
 static int cfi_panic_notifier_fn(struct notifier_block *nb,
 				  unsigned long action, void *data)
 {
@@ -89,9 +166,70 @@ static struct notifier_block cfi_panic_nb = {
 	.priority	= INT_MAX,
 };
 
+/*
+ * HCE3 mce_panic_chain notifier.
+ * Called by notify_mce_panic() just before mce_panic() calls panic().
+ * We can't prevent the panic from here, but we log CFI state for
+ * post-mortem analysis. If tolerant was set successfully, this
+ * should never fire for MCE-related panics.
+ */
+static int cfi_hce3_mce_panic_fn(struct notifier_block *nb,
+				   unsigned long action, void *data)
+{
+	pr_emerg("HCE3 mce_panic imminent on cpu%d\n",
+		 raw_smp_processor_id());
+	pr_emerg("mce_tolerant was %s set - if this fires, "
+		 "tolerant override failed\n",
+		 mce_tolerant_ptr ? "successfully" : "NOT");
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block cfi_hce3_mce_panic_nb = {
+	.notifier_call	= cfi_hce3_mce_panic_fn,
+	.priority	= INT_MAX,
+};
+
+/*
+ * Try to register on HCE3's mce_panic_chain.
+ * This is a best-effort operation — only available on HCE3 kernels.
+ */
+static void cfi_hce3_panic_chain_init(void)
+{
+	unsigned long addr;
+	int (*reg_fn)(struct notifier_block *nb);
+
+	addr = cfi_lookup_name("mce_register_panic_notifier_chain");
+	if (!addr)
+		return;
+
+	reg_fn = (void *)addr;
+	if (reg_fn(&cfi_hce3_mce_panic_nb) == 0) {
+		hce3_panic_chain_registered = true;
+		pr_info("registered on HCE3 mce_panic_chain\n");
+	}
+}
+
+static void cfi_hce3_panic_chain_exit(void)
+{
+	unsigned long addr;
+	int (*unreg_fn)(struct notifier_block *nb);
+
+	if (!hce3_panic_chain_registered)
+		return;
+
+	addr = cfi_lookup_name("mce_unregister_panic_notifier_chain");
+	if (!addr)
+		return;
+
+	unreg_fn = (void *)addr;
+	unreg_fn(&cfi_hce3_mce_panic_nb);
+	hce3_panic_chain_registered = false;
+}
+
 int cfi_suppress_init(void)
 {
 	int val, ret;
+	bool tolerant_set = false;
 
 	/* Suppress softlockup panic */
 	ret = cfi_read_int_file(PROC_SOFTLOCKUP_PANIC, &val);
@@ -123,35 +261,65 @@ int cfi_suppress_init(void)
 		pr_info("hardlockup_panic not available (%d)\n", ret);
 	}
 
-	/* Raise MCE tolerant level to prevent MCE panic */
+	/*
+	 * Raise MCE tolerant level to prevent mce_panic().
+	 * Method 1: sysfs (standard upstream kernels)
+	 * Method 2: direct variable write via kprobe (HCE3 fallback)
+	 */
 	ret = cfi_read_int_file(SYSFS_MCE_TOLERANT, &val);
 	if (ret == 0) {
 		orig_mce_tolerant = val;
 		if (val < (int)cfi_mce_tolerant) {
 			ret = cfi_write_int_file(SYSFS_MCE_TOLERANT,
 						 cfi_mce_tolerant);
-			if (ret == 0)
-				pr_info("set MCE tolerant=%u (was %d)\n",
+			if (ret == 0) {
+				pr_info("set MCE tolerant=%u via sysfs (was %d)\n",
 					cfi_mce_tolerant, val);
-			else
-				pr_warn("failed to set MCE tolerant: %d\n", ret);
+				tolerant_set = true;
+			} else {
+				pr_warn("failed to set MCE tolerant via sysfs: %d\n", ret);
+			}
+		} else {
+			tolerant_set = true;
 		}
 	} else {
-		pr_info("MCE tolerant sysfs not available (%d)\n", ret);
+		pr_info("MCE tolerant sysfs not available (%d), "
+			"trying direct variable access\n", ret);
+	}
+
+	if (!tolerant_set) {
+		ret = cfi_set_tolerant_direct(cfi_mce_tolerant);
+		if (ret == 0) {
+			tolerant_set = true;
+		} else {
+			pr_err("CRITICAL: failed to set mce_tolerant by any method! "
+			       "Fatal MCEs WILL cause panic instead of isolation.\n");
+		}
 	}
 
 	atomic_notifier_chain_register(&panic_notifier_list, &cfi_panic_nb);
 
-	pr_info("panic suppression active\n");
+	/* HCE3: register on mce_panic_chain for pre-panic notification */
+	cfi_hce3_panic_chain_init();
+
+	pr_info("panic suppression active (mce_tolerant %s)\n",
+		tolerant_set ? "set" : "FAILED");
 	return 0;
 }
 
 void cfi_suppress_exit(void)
 {
+	cfi_hce3_panic_chain_exit();
+
 	atomic_notifier_chain_unregister(&panic_notifier_list, &cfi_panic_nb);
 
-	if (orig_mce_tolerant >= 0)
+	/* Restore tolerant: prefer direct method if that's how we set it */
+	if (mce_tolerant_ptr) {
+		cfi_restore_tolerant_direct();
+	} else if (orig_mce_tolerant >= 0) {
 		cfi_write_int_file(SYSFS_MCE_TOLERANT, orig_mce_tolerant);
+	}
+
 	if (orig_hardlockup_panic >= 0)
 		cfi_write_int_file(PROC_HARDLOCKUP_PANIC, orig_hardlockup_panic);
 	if (orig_softlockup_panic >= 0)
