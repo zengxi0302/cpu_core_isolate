@@ -93,6 +93,8 @@ extern unsigned int cfi_window_secs;
 extern bool cfi_auto_isolate;
 extern bool cfi_defer_to_daemon;
 extern unsigned int cfi_defer_timeout_ms;
+extern unsigned int cfi_mce_tolerant;
+extern unsigned int cfi_lockup_thresh_secs;
 
 /*
  * Global per-CPU info array (allocated in cfi_main.c).
@@ -133,6 +135,14 @@ void cfi_debugfs_exit(void);
 
 /* --- cfi_hotplug.c (daemon ACK handler, called from netlink) --- */
 void cfi_daemon_ack_isolate(unsigned int cpu);
+
+/* --- cfi_panic_suppress.c --- */
+int  cfi_suppress_init(void);
+void cfi_suppress_exit(void);
+
+/* --- cfi_lockup.c --- */
+int  cfi_lockup_init(void);
+void cfi_lockup_exit(void);
 
 /* --- Arch backends (cfi_x86.c / cfi_arm64.c) --- */
 #ifdef CONFIG_X86

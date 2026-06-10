@@ -3,8 +3,9 @@
  * CPU Fault Isolation (CFI) - Module Entry Point
  *
  * Initializes the CFI subsystem: allocates per-CPU tracking structures,
- * registers the architecture-specific error backend, and sets up
- * netlink and sysfs interfaces.
+ * suppresses default kernel panic behavior for CPU faults, registers
+ * the architecture-specific error backend, starts lockup detection,
+ * and sets up netlink and sysfs interfaces.
  *
  * Copyright (c) 2026 openEuler Community
  */
@@ -50,14 +51,21 @@ module_param_named(defer_timeout_ms, cfi_defer_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(defer_timeout_ms,
 	"Max time to wait for daemon ACK in milliseconds (default: 30000)");
 
+unsigned int cfi_mce_tolerant = 3;
+module_param_named(mce_tolerant, cfi_mce_tolerant, uint, 0644);
+MODULE_PARM_DESC(mce_tolerant,
+	"MCE tolerant level override: 1=recover SRAR, 3=never panic (default: 3)");
+
+unsigned int cfi_lockup_thresh_secs = 30;
+module_param_named(lockup_thresh, cfi_lockup_thresh_secs, uint, 0644);
+MODULE_PARM_DESC(lockup_thresh,
+	"Seconds without scheduler activity to declare softlockup (default: 30)");
+
 /* --- Global state --- */
 
 struct cfi_cpu_info *cfi_cpus;
 const struct cfi_arch_ops *cfi_arch;
 
-/*
- * Initialize per-CPU tracking structures for all possible CPUs.
- */
 static int cfi_alloc_cpus(void)
 {
 	unsigned int cpu;
@@ -108,8 +116,10 @@ static int __init cfi_init(void)
 {
 	int ret;
 
-	pr_info("initializing (ce_thresh=%u uce_thresh=%u window=%us)\n",
-		cfi_ce_threshold, cfi_uce_threshold, cfi_window_secs);
+	pr_info("initializing (ce_thresh=%u uce_thresh=%u window=%us "
+		"mce_tolerant=%u lockup_thresh=%us)\n",
+		cfi_ce_threshold, cfi_uce_threshold, cfi_window_secs,
+		cfi_mce_tolerant, cfi_lockup_thresh_secs);
 
 	ret = cfi_alloc_cpus();
 	if (ret) {
@@ -138,6 +148,18 @@ static int __init cfi_init(void)
 	/* debugfs inject interface (non-fatal if it fails) */
 	cfi_debugfs_init();
 
+	/*
+	 * Suppress default panic behavior BEFORE registering the arch
+	 * backend. This ensures that when our MCE handler starts receiving
+	 * events, fatal MCEs flow through the decode chain instead of
+	 * triggering mce_panic().
+	 */
+	ret = cfi_suppress_init();
+	if (ret) {
+		pr_err("failed to initialize panic suppression: %d\n", ret);
+		goto err_debugfs;
+	}
+
 	/* Select and initialize architecture backend */
 #ifdef CONFIG_X86
 	cfi_arch = &cfi_x86_ops;
@@ -146,7 +168,7 @@ static int __init cfi_init(void)
 #else
 	pr_err("unsupported architecture\n");
 	ret = -ENODEV;
-	goto err_debugfs;
+	goto err_suppress;
 #endif
 
 	if (cfi_arch->init) {
@@ -154,18 +176,29 @@ static int __init cfi_init(void)
 		if (ret) {
 			pr_err("arch backend init failed: %d\n", ret);
 			cfi_arch = NULL;
-			goto err_debugfs;
+			goto err_suppress;
 		}
 	}
 
-	pr_info("initialized successfully\n");
+	/* Start lockup detection after everything else is ready */
+	ret = cfi_lockup_init();
+	if (ret) {
+		pr_err("failed to start lockup detection: %d\n", ret);
+		goto err_arch;
+	}
+
+	pr_info("initialized successfully — panic suppression and lockup detection active\n");
 	return 0;
 
-#if !defined(CONFIG_X86) && !defined(CONFIG_ARM64)
+err_arch:
+	if (cfi_arch && cfi_arch->exit)
+		cfi_arch->exit();
+	cfi_arch = NULL;
+err_suppress:
+	cfi_suppress_exit();
 err_debugfs:
 	cfi_debugfs_exit();
 	cfi_hotplug_exit();
-#endif
 err_sysfs:
 	cfi_sysfs_exit();
 err_netlink:
@@ -179,9 +212,16 @@ static void __exit cfi_exit(void)
 {
 	pr_info("unloading\n");
 
+	/* Stop lockup detection first (no more isolation triggers) */
+	cfi_lockup_exit();
+
+	/* Unregister arch handler before restoring panic behavior */
 	if (cfi_arch && cfi_arch->exit)
 		cfi_arch->exit();
 	cfi_arch = NULL;
+
+	/* Restore original panic settings */
+	cfi_suppress_exit();
 
 	cfi_debugfs_exit();
 	cfi_hotplug_exit();
@@ -198,4 +238,4 @@ module_exit(cfi_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("openEuler Community");
 MODULE_DESCRIPTION("CPU Core/Cache Fault Isolation for improved system reliability");
-MODULE_VERSION("0.1.0");
+MODULE_VERSION("0.2.0");

@@ -11,7 +11,9 @@ cpu_fault_isolate-y := core/cfi_main.o \
 		       core/cfi_hotplug.o \
 		       core/cfi_netlink.o \
 		       core/cfi_sysfs.o \
-		       core/cfi_debugfs.o
+		       core/cfi_debugfs.o \
+		       core/cfi_panic_suppress.o \
+		       core/cfi_lockup.o
 
 # Architecture-specific backends
 cpu_fault_isolate-$(CONFIG_X86)   += arch/x86/cfi_x86.o \

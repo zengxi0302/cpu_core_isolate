@@ -14,7 +14,7 @@
  * Coexistence:
  *   - Works alongside rasdaemon and mcelog
  *   - MCE decode chain supports multiple notifiers
- *   - We use MCE_PRIO_LOWEST to run after EDAC and other handlers
+ *   - We use high priority (above EDAC) to start isolation ASAP
  */
 
 #define pr_fmt(fmt) CFI_MODULE_NAME ": " fmt
@@ -61,10 +61,13 @@ static int cfi_x86_mce_notifier(struct notifier_block *nb,
 static struct notifier_block cfi_x86_mce_nb = {
 	.notifier_call	= cfi_x86_mce_notifier,
 	/*
-	 * Run at lowest priority so EDAC and other handlers run first.
-	 * This ensures we don't interfere with existing error handling.
+	 * Run at high priority to start isolation as early as possible.
+	 * With MCE tolerant level raised by cfi_panic_suppress, fatal MCEs
+	 * now flow through the decode chain instead of triggering mce_panic().
+	 * We must act before other handlers to minimize the window where a
+	 * CPU with corrupted context continues executing.
 	 */
-	.priority	= MCE_PRIO_LOWEST,
+	.priority	= MCE_PRIO_EDAC + 1,
 };
 
 static int cfi_x86_describe_error(const struct cfi_error_event *rec,

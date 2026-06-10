@@ -15,6 +15,7 @@
 
 #include <linux/kernel.h>
 #include <linux/cpu.h>
+#include <linux/cpumask.h>
 #include <linux/cpuhotplug.h>
 #include <linux/workqueue.h>
 #include <linux/timer.h>
@@ -132,7 +133,9 @@ void cfi_defer_timer_fn(struct timer_list *t)
  * Begin the isolation process for a CPU.
  *
  * @cpu: logical CPU number to isolate
- * @urgent: if true (UCE fatal), skip daemon deferral and offline immediately
+ * @urgent: if true (lockup/UCE fatal), skip daemon deferral and offline
+ *          immediately. Also ensures work is scheduled on a different CPU,
+ *          since the faulting CPU may be non-functional (lockup).
  *
  * When defer_to_daemon is enabled and not urgent, we start a timer
  * and wait for the daemon to acknowledge (via netlink ACK_ISOLATE).
@@ -152,10 +155,30 @@ void cfi_begin_isolation(unsigned int cpu, bool urgent)
 		mod_timer(&ci->defer_timer,
 			  jiffies + msecs_to_jiffies(cfi_defer_timeout_ms));
 	} else {
+		unsigned int target;
+
 		if (urgent)
-			pr_info("cpu%u: urgent isolation (UCE fatal), skipping daemon deferral\n",
+			pr_info("cpu%u: urgent isolation, skipping daemon deferral\n",
 				cpu);
-		schedule_work(&ci->offline_work);
+
+		/*
+		 * For urgent isolation (lockup, fatal MCE), ensure the
+		 * offline work runs on a healthy CPU. The faulting CPU may
+		 * not be processing its workqueue (hardlockup) or may have
+		 * corrupted context (MCE PCC).
+		 */
+		target = raw_smp_processor_id();
+		if (urgent && target == cpu) {
+			target = cpumask_any_but(cpu_online_mask, cpu);
+			if (target >= nr_cpu_ids) {
+				pr_err("cpu%u: last online CPU, cannot self-isolate\n",
+				       cpu);
+				return;
+			}
+			queue_work_on(target, system_wq, &ci->offline_work);
+		} else {
+			schedule_work(&ci->offline_work);
+		}
 	}
 }
 

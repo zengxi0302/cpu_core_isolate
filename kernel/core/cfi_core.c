@@ -158,6 +158,18 @@ void cfi_report_error(struct cfi_error_event *event)
 		goto out;
 	}
 
+	/*
+	 * Lockup events bypass threshold logic entirely.
+	 * A single lockup is an immediate isolation trigger — the CPU is
+	 * already non-functional.
+	 */
+	if (event->error_type & (CFI_ERR_HARDLOCKUP | CFI_ERR_SOFTLOCKUP)) {
+		cfi_transition(ci, cpu, CFI_STATE_ISOLATING);
+		spin_unlock_irqrestore(&ci->lock, flags);
+		cfi_begin_isolation(cpu, true);
+		return;
+	}
+
 	switch (ci->state) {
 	case CFI_STATE_ONLINE:
 		if (ci->uce_count >= cfi_uce_threshold) {
