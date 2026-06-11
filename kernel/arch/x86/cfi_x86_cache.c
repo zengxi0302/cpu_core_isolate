@@ -66,6 +66,10 @@ static u32 cfi_x86_ll_to_type(unsigned int ll, unsigned int tt)
  */
 static u32 cfi_x86_classify_errcode(u16 errcode)
 {
+	/* Memory errors belong to the memory fault domain (mfi_x86.c) */
+	if (cfi_x86_is_memory_errcode(errcode))
+		return 0;
+
 	/* Simple cache hierarchy errors: 0x000C-0x000F */
 	if (MCI_ERR_IS_CACHE_SIMPLE(errcode))
 		return cfi_x86_ll_to_type(MCI_ERR_LL(errcode),

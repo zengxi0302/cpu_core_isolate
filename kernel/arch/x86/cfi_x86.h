@@ -73,6 +73,27 @@
 /* Model-specific error code (bits [31:16]) */
 #define MCI_STATUS_MSCODE(s)	(((s) >> 16) & 0xFFFF)
 
+/*
+ * True if the MCACOD signature identifies a memory error. These belong
+ * to the memory fault domain (mfi_x86.c); the CPU domain must ignore
+ * them so a degrading DIMM cannot push a healthy CPU into isolation.
+ */
+static inline bool cfi_x86_is_memory_errcode(u16 mcacod)
+{
+	mcacod &= MCACOD;	/* strip the filter bit (bit 12) */
+
+	/* Memory controller errors: 0000_0001_MMMM_CCCC (incl. scrub) */
+	if ((mcacod & 0xff80) == 0x0080)
+		return true;
+
+	/* Poison consumption signatures reported via cache banks */
+	if (mcacod == MCACOD_DATA || mcacod == MCACOD_INSTR ||
+	    mcacod == MCACOD_L3WB)
+		return true;
+
+	return false;
+}
+
 /* Classify an x86 MCE into cfi_error_event fields */
 int cfi_x86_classify_mce(const struct mce *m, struct cfi_error_event *event);
 

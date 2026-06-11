@@ -33,25 +33,7 @@
 #include <asm/mce.h>
 #include "../../core/cfi_internal.h"
 #include "../../core/mfi_internal.h"
-
-/* True if the MCACOD signature identifies a memory error with an address */
-static bool mfi_x86_is_memory_error(u16 mcacod)
-{
-	/* Memory controller errors: 0000_0001_MMMM_CCCC */
-	if ((mcacod & 0xff80) == 0x0080)
-		return true;
-
-	/* Patrol scrub (subset of the above, kept explicit for clarity) */
-	if ((mcacod & MCACOD_SCRUBMSK) == MCACOD_SCRUB)
-		return true;
-
-	/* Poison consumption signatures reported via cache banks */
-	if (mcacod == MCACOD_DATA || mcacod == MCACOD_INSTR ||
-	    mcacod == MCACOD_L3WB)
-		return true;
-
-	return false;
-}
+#include "cfi_x86.h"
 
 static int mfi_x86_mce_notifier(struct notifier_block *nb,
 				unsigned long val, void *data)
@@ -68,7 +50,7 @@ static int mfi_x86_mce_notifier(struct notifier_block *nb,
 		return NOTIFY_DONE;
 
 	mcacod = m->status & MCACOD;
-	if (!mfi_x86_is_memory_error(mcacod))
+	if (!cfi_x86_is_memory_errcode(mcacod))
 		return NOTIFY_DONE;
 
 	/* Page accounting needs a physical address */
