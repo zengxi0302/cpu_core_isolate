@@ -249,3 +249,28 @@ cpu_fault_isolate: registered on HCE3 fma_mce_do_chain
 | tolerant=3 可能掩盖其他 fatal MCE | 理论上降低保护 | CFI 主动处理所有 MCE，比 panic 更精准 |
 | lockup CPU 上的 VM 可能已损坏 | 数据一致性 | 这是 "止损" 而非 "无损"，与直接 panic 相比仍是改善 |
 | 模块 unload 时恢复不完整 | 残留低保护状态 | exit 路径严格恢复所有原值 |
+
+---
+
+## T9: 落点甄别——panic 抑制后内核态 UCE 没有安全默认值（难度 ★★★★★）
+
+- **难点**：tolerant=3 压住 mce_panic() 后，内核带毒继续跑 = 静默数据损坏，比宕机更糟
+- **常规失效**：直接放行 → 静默损坏；一律 panic → 丢掉可救场景（虚机页占大头）
+- **解法**：白名单判决（PCC=0 且 RIPV=1 且用户/虚机页或空闲页才救）；
+  判定只读 vmemmap 元数据；mem_triage 灰度开关；判决表 18 项主机单测全绿
+- 代码：`core/mfi_policy.h::mfi_triage_decide()`（纯函数，可单测）
+
+## T10: 不改内核复用 memory_failure 全套页隔离（难度 ★★★★）
+
+- **难点**：soft_offline_page 未导出；memory_failure 结果异步；GHES/CEC/madvise 多方处置同一页
+- **解法**：① kprobe 查符号直调 soft_offline_page；② 硬隔离走 memory_failure_queue
+  （GHES 同款导出路径，NMI 安全）；③ memory_failure_event tracepoint 回执
+  （运行时查找）+ PageHWPoison 标志双重去重
+- 代码：`core/mfi_page.c`
+
+## T11: 两个故障域共享一条 MCE 通路（难度 ★★★）
+
+- **难点**：内存控制器错误码落入 CPU 域 GENERIC_CORE 兜底 ——
+  坏 DIMM 的 CE 风暴会把健康核推进 DEGRADED/隔离（实测发现并修复）
+- **解法**：MCACOD 内存签名判定提为共享内联（`cfi_x86.h::cfi_x86_is_memory_errcode`），
+  CPU 域显式忽略内存错误；CEC 探测自动降级预隔离；DIMM 记账只上报不动整机
