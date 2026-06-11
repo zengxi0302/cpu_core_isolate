@@ -205,7 +205,7 @@ CFI_GLOBAL_ATTR_BOOL_RW(auto_isolate, cfi_auto_isolate);
 static ssize_t version_g_show(struct kobject *kobj,
 			      struct kobj_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "0.1.0\n");
+	return sysfs_emit(buf, "%s\n", CFI_VERSION);
 }
 static struct kobj_attribute cfi_attr_version =
 	__ATTR(version, 0444, version_g_show, NULL);
@@ -256,6 +256,11 @@ int cfi_sysfs_init(void)
 	cpus_read_unlock();
 
 	return 0;
+}
+
+struct kobject *cfi_sysfs_root(void)
+{
+	return cfi_kobj;
 }
 
 void cfi_sysfs_exit(void)

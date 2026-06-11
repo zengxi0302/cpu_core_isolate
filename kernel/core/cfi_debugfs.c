@@ -7,7 +7,7 @@
  * calls cfi_report_error(), enabling testing on virtual machines and
  * environments without hardware error injection support.
  *
- * Usage:
+ * Usage (CPU domain):
  *   echo "cpu=4 type=cache_l2 severity=ce" > /sys/kernel/debug/cfi/inject
  *
  * Supported type values:
@@ -18,6 +18,18 @@
  *   ce   - Corrected Error
  *   ucr  - Uncorrected Recoverable
  *   ucf  - Uncorrected Fatal
+ *
+ * Usage (memory domain):
+ *   echo "domain=mem pfn=0x12345 type=ce" > /sys/kernel/debug/cfi/inject
+ *   echo "domain=mem pfn=0x12345 type=uce_srao" > inject
+ *   echo "domain=mem pfn=0x12345 type=uce_srar [kernel=1]" > inject
+ *
+ * Memory injection drives the REAL handling path: the PFN must be
+ * valid, threshold crossings actually soft-offline the page, UCEs
+ * actually queue memory_failure(), and "type=uce_srar kernel=1" with
+ * mem_triage enabled runs the real triage verdict — which panics the
+ * machine when the verdict is panic. Use a page you own (see
+ * test/inject/mem_inject.sh).
  */
 
 #define pr_fmt(fmt) "cpu_fault_isolate: " fmt
@@ -27,7 +39,9 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/topology.h>
+#include <linux/mm.h>
 #include "cfi_internal.h"
+#include "mfi_internal.h"
 
 static struct dentry *cfi_debugfs_dir;
 
@@ -112,6 +126,79 @@ static const char *find_key(const char *buf, size_t buflen,
 	return NULL;
 }
 
+/* Parse "key=<uint>" with a local copy (handles hex via base 0) */
+static int parse_uint(const char *val, size_t val_len, unsigned int base,
+		      unsigned long *out)
+{
+	char tmp[24] = {};
+
+	if (!val || val_len >= sizeof(tmp))
+		return -EINVAL;
+	memcpy(tmp, val, val_len);
+	return kstrtoul(tmp, base, out);
+}
+
+/*
+ * Memory domain injection:
+ *   "domain=mem pfn=0x12345 type=ce|uce_srao|uce_srar [kernel=1] [ripv=0] [pcc=1]"
+ * Feeds the REAL handling path via mfi_report_mem_error() /
+ * mfi_triage_kernel_uce().
+ */
+static ssize_t cfi_inject_mem(const char *buf, size_t count)
+{
+	struct mfi_mem_error err = {};
+	const char *val;
+	size_t val_len;
+	unsigned long pfn, opt;
+	bool kernel_ctx = false;
+	int ret;
+
+	val = find_key(buf, count, "pfn", &val_len);
+	ret = parse_uint(val, val_len, 0, &pfn);
+	if (ret) {
+		pr_err("inject: mem: missing or invalid 'pfn=' parameter\n");
+		return -EINVAL;
+	}
+	if (!pfn_valid(pfn)) {
+		pr_err("inject: mem: pfn 0x%lx is not valid on this system\n",
+		       pfn);
+		return -EINVAL;
+	}
+
+	val = find_key(buf, count, "type", &val_len);
+	if (!val) {
+		pr_err("inject: mem: missing 'type=' parameter\n");
+		return -EINVAL;
+	}
+	if (val_len == 2 && !strncmp(val, "ce", 2)) {
+		err.type = MFI_MEM_CE;
+	} else if (val_len == 8 && !strncmp(val, "uce_srao", 8)) {
+		err.type = MFI_MEM_UCE_DEFERRED;
+	} else if (val_len == 8 && !strncmp(val, "uce_srar", 8)) {
+		err.type = MFI_MEM_UCE_CONSUMED;
+	} else {
+		pr_err("inject: mem: unknown type (use: ce, uce_srao, uce_srar)\n");
+		return -EINVAL;
+	}
+
+	val = find_key(buf, count, "kernel", &val_len);
+	if (val && !parse_uint(val, val_len, 10, &opt))
+		kernel_ctx = !!opt;
+
+	err.pfn = pfn;
+	err.addr = (u64)pfn << PAGE_SHIFT;
+	err.cpu = raw_smp_processor_id();
+	err.flags = MFI_EVF_INJECTED;
+	if (kernel_ctx)
+		err.flags |= MFI_EVF_KERNEL_CTX;
+
+	pr_info("inject: mem: pfn=0x%lx type=%d kernel=%d\n",
+		pfn, err.type, kernel_ctx);
+
+	mfi_report_mem_error(&err);
+	return count;
+}
+
 /*
  * Write handler for /sys/kernel/debug/cfi/inject.
  *
@@ -142,6 +229,14 @@ static ssize_t cfi_inject_write(struct file *file, const char __user *ubuf,
 		return -EFAULT;
 	}
 	buf[count] = '\0';
+
+	/* Dispatch memory domain injection */
+	val = find_key(buf, count, "domain", &val_len);
+	if (val && val_len == 3 && !strncmp(val, "mem", 3)) {
+		ret = cfi_inject_mem(buf, count);
+		kfree(buf);
+		return ret;
+	}
 
 	/* Parse cpu=N */
 	val = find_key(buf, count, "cpu", &val_len);
@@ -252,6 +347,12 @@ static int cfi_inject_help_show(struct seq_file *m, void *v)
 	seq_puts(m, "  ce              Corrected Error\n");
 	seq_puts(m, "  ucr             Uncorrected Recoverable\n");
 	seq_puts(m, "  ucf             Uncorrected Fatal\n");
+
+	seq_puts(m, "\nMemory domain:\n");
+	seq_puts(m, "  echo \"domain=mem pfn=0x12345 type=ce\" > inject\n");
+	seq_puts(m, "  types: ce, uce_srao, uce_srar\n");
+	seq_puts(m, "  options: kernel=0|1\n");
+	seq_puts(m, "  WARNING: drives the real page isolation path\n");
 
 	return 0;
 }

@@ -90,6 +90,64 @@ struct cfi_error_event {
 } __attribute__((packed));
 
 /*
+ * Fault domain. CFI started with CPU core/cache faults; the MEM domain
+ * (MFI) adds memory/DRAM fault isolation. Carried in CFI_ATTR_DOMAIN on
+ * netlink messages that apply to both domains.
+ */
+enum cfi_domain {
+	CFI_DOMAIN_CPU		= 0,
+	CFI_DOMAIN_MEM		= 1,
+};
+
+/*
+ * Memory fault domain (MFI) - page isolation states.
+ * Pages are tracked in a bounded hash table; OFFLINED pages are dropped
+ * from the table (the kernel's persistent HWPoison flag is the source
+ * of truth once a page is gone).
+ */
+enum mfi_page_state {
+	MFI_PAGE_WATCHED	= 0,	/* CEs accumulating, under watch */
+	MFI_PAGE_PRE_ISO	= 1,	/* soft offline queued/in progress */
+	MFI_PAGE_PRE_ISO_FAILED	= 2,	/* migration failed, page still live */
+	MFI_PAGE_POISONED	= 3,	/* UCE seen, memory_failure queued */
+	MFI_PAGE_OFFLINED	= 4,	/* page permanently removed */
+	MFI_PAGE_FAILED		= 5,	/* hard offline failed, page still live */
+};
+
+/*
+ * Memory error flavor as seen by MFI.
+ */
+enum mfi_mem_err_type {
+	MFI_MEM_CE		= 0,	/* corrected error */
+	MFI_MEM_UCE_DEFERRED	= 1,	/* UCE found async (SRAO/patrol/deferred) */
+	MFI_MEM_UCE_CONSUMED	= 2,	/* UCE consumed (SRAR) */
+};
+
+/* Flags for struct mfi_mem_event.flags */
+#define MFI_EVF_KERNEL_CTX	0x01	/* consumed in kernel context */
+#define MFI_EVF_PRE_ISOLATE	0x02	/* result of proactive soft offline */
+#define MFI_EVF_TRIAGED		0x04	/* handled by Phase-2 triage path */
+#define MFI_EVF_INJECTED	0x08	/* software-injected (debugfs) */
+
+/*
+ * Memory error record exchanged between kernel and userspace.
+ */
+struct mfi_mem_event {
+	__u64	pfn;		/* page frame number of the affected page */
+	__u64	addr;		/* full physical address (0 if unknown) */
+	__u32	cpu;		/* CPU that observed the error */
+	__u32	pid;		/* interrupted/owning task (0 if unknown) */
+	__u8	err_type;	/* enum mfi_mem_err_type */
+	__u8	page_state;	/* enum mfi_page_state after handling */
+	__u8	flags;		/* MFI_EVF_* */
+	__u8	reserved;
+	__u32	ce_count;	/* page CE count in current window */
+	__u64	timestamp_ns;	/* kernel timestamp (CLOCK_MONOTONIC) */
+	char	comm[16];	/* interrupted task comm ("" if unknown) */
+	char	dimm_label[32];	/* EDAC DIMM label ("" if unknown) */
+} __attribute__((packed));
+
+/*
  * Generic netlink commands.
  */
 enum cfi_nl_cmd {
@@ -102,6 +160,17 @@ enum cfi_nl_cmd {
 	CFI_CMD_ISOLATE		= 6,	/* U->K: force isolate a CPU */
 	CFI_CMD_UNISOLATE	= 7,	/* U->K: bring CPU back online */
 	CFI_CMD_ACK_ISOLATE	= 8,	/* U->K: daemon confirms pre-isolation done */
+
+	/* Memory fault domain (MFI) */
+	CFI_CMD_MEM_ERROR_EVENT	= 9,	/* K->U: memory error record */
+	CFI_CMD_MEM_PAGE_OFFLINED = 10,	/* K->U: page isolated successfully */
+	CFI_CMD_MEM_PAGE_FAILED	= 11,	/* K->U: isolation failed, page live */
+	CFI_CMD_MEM_VM_KILLED	= 12,	/* K->U: triage killed page owner */
+	CFI_CMD_MEM_MIGRATE_ADVISED = 13, /* K->U: DIMM threshold, evacuate host */
+	CFI_CMD_MEM_GET_STATUS	= 14,	/* U->K: query MFI statistics */
+	CFI_CMD_MEM_GET_STATUS_REPLY = 15, /* K->U: reply to MEM_GET_STATUS */
+	CFI_CMD_MEM_SET_POLICY	= 16,	/* U->K: update MFI thresholds */
+	CFI_CMD_MEM_OFFLINE_PAGE = 17,	/* U->K: manually soft-offline a PFN */
 	__CFI_CMD_MAX,
 };
 #define CFI_CMD_MAX	(__CFI_CMD_MAX - 1)
@@ -125,8 +194,34 @@ enum cfi_nl_attr {
 	CFI_ATTR_SOCKET		= 12,	/* u32: socket id */
 	CFI_ATTR_CORE_ID	= 13,	/* u32: physical core id */
 	CFI_ATTR_PAD		= 14,
+
+	/* Memory fault domain (MFI) */
+	CFI_ATTR_DOMAIN		= 15,	/* u8: enum cfi_domain */
+	CFI_ATTR_PFN		= 16,	/* u64: page frame number */
+	CFI_ATTR_MEM_REC	= 17,	/* binary: struct mfi_mem_event */
+	CFI_ATTR_PAGE_STATE	= 18,	/* u8: enum mfi_page_state */
+	CFI_ATTR_DIMM_LABEL	= 19,	/* string: EDAC DIMM label */
+	CFI_ATTR_PID		= 20,	/* u32: task pid */
+	CFI_ATTR_PAGE_CE_THRESH	= 21,	/* u32: per-page CE threshold */
+	CFI_ATTR_MEM_WINDOW_SEC	= 22,	/* u32: page CE window in seconds */
+	CFI_ATTR_MEM_STATS	= 23,	/* binary: struct mfi_stats_rec */
 	__CFI_ATTR_MAX,
 };
 #define CFI_ATTR_MAX	(__CFI_ATTR_MAX - 1)
+
+/*
+ * MFI statistics snapshot, returned in CFI_ATTR_MEM_STATS.
+ */
+struct mfi_stats_rec {
+	__u64	ce_total;		/* memory CEs observed */
+	__u64	uce_async;		/* UCEs found before consumption */
+	__u64	uce_consumed;		/* UCEs consumed (SRAR) */
+	__u64	pages_watched;		/* pages currently tracked */
+	__u64	pages_pre_offlined;	/* pages proactively soft-offlined */
+	__u64	pages_offlined;		/* pages hard-offlined after UCE */
+	__u64	pages_failed;		/* isolation failures (page still live) */
+	__u64	triage_saved;		/* kernel-ctx UCEs recovered by triage */
+	__u64	triage_panic;		/* kernel-ctx UCEs escalated to panic */
+} __attribute__((packed));
 
 #endif /* _UAPI_CFI_H */

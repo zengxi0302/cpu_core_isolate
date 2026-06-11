@@ -18,6 +18,7 @@
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include "cfi_internal.h"
+#include "mfi_internal.h"
 
 /* --- Module parameters --- */
 
@@ -60,6 +61,45 @@ unsigned int cfi_lockup_thresh_secs = 30;
 module_param_named(lockup_thresh, cfi_lockup_thresh_secs, uint, 0644);
 MODULE_PARM_DESC(lockup_thresh,
 	"Seconds without scheduler activity to declare softlockup (default: 30)");
+
+/* --- Memory fault domain (MFI) parameters --- */
+
+bool mfi_enable = true;
+module_param_named(mem_enable, mfi_enable, bool, 0644);
+MODULE_PARM_DESC(mem_enable,
+	"Enable the memory fault isolation domain (default: Y)");
+
+bool mfi_pre_isolate = true;
+module_param_named(mem_pre_isolate, mfi_pre_isolate, bool, 0644);
+MODULE_PARM_DESC(mem_pre_isolate,
+	"Proactively soft-offline pages with recurring CEs (default: Y; "
+	"auto-disabled when RAS CEC is active)");
+
+unsigned int mfi_page_ce_threshold = 8;
+module_param_named(page_ce_threshold, mfi_page_ce_threshold, uint, 0644);
+MODULE_PARM_DESC(page_ce_threshold,
+	"Per-page CEs in window to trigger pre-isolation (default: 8)");
+
+unsigned int mfi_window_secs = 86400;
+module_param_named(mem_window_secs, mfi_window_secs, uint, 0644);
+MODULE_PARM_DESC(mem_window_secs,
+	"Page/DIMM CE counting window in seconds (default: 86400)");
+
+unsigned int mfi_dimm_ce_threshold = 1000;
+module_param_named(dimm_ce_threshold, mfi_dimm_ce_threshold, uint, 0644);
+MODULE_PARM_DESC(dimm_ce_threshold,
+	"Per-DIMM CEs in window to advise host evacuation (default: 1000)");
+
+unsigned int mfi_dimm_uce_threshold = 3;
+module_param_named(dimm_uce_threshold, mfi_dimm_uce_threshold, uint, 0644);
+MODULE_PARM_DESC(dimm_uce_threshold,
+	"Per-DIMM UCEs in window to advise host evacuation (default: 3)");
+
+bool mfi_triage = false;
+module_param_named(mem_triage, mfi_triage, bool, 0644);
+MODULE_PARM_DESC(mem_triage,
+	"Phase-2 kernel-context UCE triage: recover user/guest page UCEs, "
+	"controlled panic otherwise (default: N, enable after grayscale)");
 
 /* --- Global state --- */
 
@@ -180,16 +220,28 @@ static int __init cfi_init(void)
 		}
 	}
 
+	/*
+	 * Memory fault domain. Needs panic suppression (fatal memory
+	 * MCEs must reach the decode chain) and the sysfs root.
+	 */
+	ret = mfi_init();
+	if (ret) {
+		pr_err("memory fault domain init failed: %d\n", ret);
+		goto err_arch;
+	}
+
 	/* Start lockup detection after everything else is ready */
 	ret = cfi_lockup_init();
 	if (ret) {
 		pr_err("failed to start lockup detection: %d\n", ret);
-		goto err_arch;
+		goto err_mfi;
 	}
 
 	pr_info("initialized successfully — panic suppression and lockup detection active\n");
 	return 0;
 
+err_mfi:
+	mfi_exit();
 err_arch:
 	if (cfi_arch && cfi_arch->exit)
 		cfi_arch->exit();
@@ -215,6 +267,9 @@ static void __exit cfi_exit(void)
 	/* Stop lockup detection first (no more isolation triggers) */
 	cfi_lockup_exit();
 
+	/* Memory domain: unregister notifiers/probes, flush offline work */
+	mfi_exit();
+
 	/* Unregister arch handler before restoring panic behavior */
 	if (cfi_arch && cfi_arch->exit)
 		cfi_arch->exit();
@@ -237,5 +292,5 @@ module_exit(cfi_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("openEuler Community");
-MODULE_DESCRIPTION("CPU Core/Cache Fault Isolation for improved system reliability");
-MODULE_VERSION("0.2.0");
+MODULE_DESCRIPTION("CPU core/cache and memory fault isolation for improved system reliability");
+MODULE_VERSION(CFI_VERSION);

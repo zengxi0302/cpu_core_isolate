@@ -17,6 +17,7 @@
 #include "../include/uapi/cfi.h"
 
 #define CFI_MODULE_NAME		"cpu_fault_isolate"
+#define CFI_VERSION		"0.2.0"
 #define CFI_ERROR_LOG_MAX	64	/* Max recent errors per CPU */
 
 /* Forward declarations */
@@ -128,6 +129,8 @@ int  cfi_nl_send_state_change(unsigned int cpu, enum cfi_cpu_state state);
 /* --- cfi_sysfs.c --- */
 int  cfi_sysfs_init(void);
 void cfi_sysfs_exit(void);
+/* Root kobject (/sys/kernel/cfi), parent for the MFI "mem" subtree */
+struct kobject *cfi_sysfs_root(void);
 
 /* --- cfi_debugfs.c --- */
 int  cfi_debugfs_init(void);

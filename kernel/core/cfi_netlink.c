@@ -15,6 +15,13 @@
  *   - CFI_CMD_ISOLATE: Force isolate a CPU
  *   - CFI_CMD_UNISOLATE: Bring CPU back online
  *   - CFI_CMD_ACK_ISOLATE: Daemon confirms pre-isolation steps done
+ *
+ * Memory fault domain (MFI) additions:
+ *   K->U: MEM_ERROR_EVENT, MEM_PAGE_OFFLINED, MEM_PAGE_FAILED,
+ *         MEM_VM_KILLED, MEM_MIGRATE_ADVISED
+ *   U->K: MEM_GET_STATUS, MEM_SET_POLICY, MEM_OFFLINE_PAGE
+ * Memory events carry CFI_ATTR_DOMAIN=CFI_DOMAIN_MEM and need no ACK
+ * protocol: page isolation must not wait for the daemon.
  */
 
 #define pr_fmt(fmt) "cpu_fault_isolate: " fmt
@@ -22,6 +29,7 @@
 #include <linux/module.h>
 #include <net/genetlink.h>
 #include "cfi_internal.h"
+#include "mfi_internal.h"
 
 /* Attribute validation policy */
 static const struct nla_policy cfi_nl_policy[__CFI_ATTR_MAX] = {
@@ -38,6 +46,16 @@ static const struct nla_policy cfi_nl_policy[__CFI_ATTR_MAX] = {
 	[CFI_ATTR_USER_PINNED]	= { .type = NLA_U8 },
 	[CFI_ATTR_SOCKET]	= { .type = NLA_U32 },
 	[CFI_ATTR_CORE_ID]	= { .type = NLA_U32 },
+	[CFI_ATTR_DOMAIN]	= { .type = NLA_U8 },
+	[CFI_ATTR_PFN]		= { .type = NLA_U64 },
+	[CFI_ATTR_MEM_REC]	= { .len = sizeof(struct mfi_mem_event) },
+	[CFI_ATTR_PAGE_STATE]	= { .type = NLA_U8 },
+	[CFI_ATTR_DIMM_LABEL]	= { .type = NLA_NUL_STRING,
+				    .len = MFI_DIMM_LABEL_LEN - 1 },
+	[CFI_ATTR_PID]		= { .type = NLA_U32 },
+	[CFI_ATTR_PAGE_CE_THRESH] = { .type = NLA_U32 },
+	[CFI_ATTR_MEM_WINDOW_SEC] = { .type = NLA_U32 },
+	[CFI_ATTR_MEM_STATS]	= { .len = sizeof(struct mfi_stats_rec) },
 };
 
 /* Forward declarations for command handlers */
@@ -46,6 +64,9 @@ static int cfi_nl_set_policy(struct sk_buff *skb, struct genl_info *info);
 static int cfi_nl_isolate(struct sk_buff *skb, struct genl_info *info);
 static int cfi_nl_unisolate(struct sk_buff *skb, struct genl_info *info);
 static int cfi_nl_ack_isolate(struct sk_buff *skb, struct genl_info *info);
+static int cfi_nl_mem_get_status(struct sk_buff *skb, struct genl_info *info);
+static int cfi_nl_mem_set_policy(struct sk_buff *skb, struct genl_info *info);
+static int cfi_nl_mem_offline_page(struct sk_buff *skb, struct genl_info *info);
 
 /* Multicast groups */
 static const struct genl_multicast_group cfi_mcgrps[] = {
@@ -76,6 +97,20 @@ static const struct genl_small_ops cfi_nl_ops[] = {
 	{
 		.cmd	= CFI_CMD_ACK_ISOLATE,
 		.doit	= cfi_nl_ack_isolate,
+		.flags	= GENL_ADMIN_PERM,
+	},
+	{
+		.cmd	= CFI_CMD_MEM_GET_STATUS,
+		.doit	= cfi_nl_mem_get_status,
+	},
+	{
+		.cmd	= CFI_CMD_MEM_SET_POLICY,
+		.doit	= cfi_nl_mem_set_policy,
+		.flags	= GENL_ADMIN_PERM,
+	},
+	{
+		.cmd	= CFI_CMD_MEM_OFFLINE_PAGE,
+		.doit	= cfi_nl_mem_offline_page,
 		.flags	= GENL_ADMIN_PERM,
 	},
 };
@@ -209,6 +244,64 @@ static int cfi_nl_ack_isolate(struct sk_buff *skb, struct genl_info *info)
 	return 0;
 }
 
+/* --- Memory domain (MFI) command handlers --- */
+
+static int cfi_nl_mem_get_status(struct sk_buff *skb, struct genl_info *info)
+{
+	struct mfi_stats_rec rec;
+	struct sk_buff *reply;
+	void *hdr;
+
+	reply = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
+	if (!reply)
+		return -ENOMEM;
+
+	hdr = genlmsg_put_reply(reply, info, &cfi_genl_family, 0,
+				CFI_CMD_MEM_GET_STATUS_REPLY);
+	if (!hdr) {
+		nlmsg_free(reply);
+		return -EMSGSIZE;
+	}
+
+	mfi_stats_snapshot(&rec);
+	nla_put_u8(reply, CFI_ATTR_DOMAIN, CFI_DOMAIN_MEM);
+	nla_put(reply, CFI_ATTR_MEM_STATS, sizeof(rec), &rec);
+
+	genlmsg_end(reply, hdr);
+	return genlmsg_reply(reply, info);
+}
+
+static int cfi_nl_mem_set_policy(struct sk_buff *skb, struct genl_info *info)
+{
+	if (info->attrs[CFI_ATTR_PAGE_CE_THRESH])
+		mfi_page_ce_threshold =
+			nla_get_u32(info->attrs[CFI_ATTR_PAGE_CE_THRESH]);
+	if (info->attrs[CFI_ATTR_MEM_WINDOW_SEC])
+		mfi_window_secs =
+			nla_get_u32(info->attrs[CFI_ATTR_MEM_WINDOW_SEC]);
+
+	pr_info("mem: policy updated: page_ce_thresh=%u window=%us\n",
+		mfi_page_ce_threshold, mfi_window_secs);
+	return 0;
+}
+
+static int cfi_nl_mem_offline_page(struct sk_buff *skb, struct genl_info *info)
+{
+	unsigned long pfn;
+
+	if (!info->attrs[CFI_ATTR_PFN])
+		return -EINVAL;
+
+	pfn = nla_get_u64(info->attrs[CFI_ATTR_PFN]);
+	if (!pfn_valid(pfn))
+		return -EINVAL;
+
+	pr_info("mem: manual soft offline requested for pfn 0x%lx\n", pfn);
+	if (!mfi_page_soft_offline(pfn))
+		return -EOPNOTSUPP;
+	return 0;
+}
+
 /* --- Multicast event senders --- */
 
 int cfi_nl_send_error(const struct cfi_error_event *event)
@@ -252,6 +345,61 @@ int cfi_nl_send_state_change(unsigned int cpu, enum cfi_cpu_state state)
 
 	nla_put_u32(skb, CFI_ATTR_CPU, cpu);
 	nla_put_u8(skb, CFI_ATTR_STATE, state);
+
+	genlmsg_end(skb, hdr);
+	return genlmsg_multicast(&cfi_genl_family, skb, 0, 0, GFP_ATOMIC);
+}
+
+/*
+ * Multicast a memory domain event. @cmd selects the event flavor
+ * (MEM_ERROR_EVENT / MEM_PAGE_OFFLINED / MEM_PAGE_FAILED /
+ * MEM_VM_KILLED); the full record rides in CFI_ATTR_MEM_REC with the
+ * most useful fields duplicated as discrete attributes.
+ */
+int cfi_nl_send_mem_event(u8 cmd, const struct mfi_mem_event *event)
+{
+	struct sk_buff *skb;
+	void *hdr;
+
+	skb = genlmsg_new(NLMSG_GOODSIZE, GFP_ATOMIC);
+	if (!skb)
+		return -ENOMEM;
+
+	hdr = genlmsg_put(skb, 0, 0, &cfi_genl_family, 0, cmd);
+	if (!hdr) {
+		nlmsg_free(skb);
+		return -EMSGSIZE;
+	}
+
+	nla_put_u8(skb, CFI_ATTR_DOMAIN, CFI_DOMAIN_MEM);
+	nla_put(skb, CFI_ATTR_MEM_REC, sizeof(*event), event);
+	nla_put_u64_64bit(skb, CFI_ATTR_PFN, event->pfn, CFI_ATTR_PAD);
+	nla_put_u8(skb, CFI_ATTR_PAGE_STATE, event->page_state);
+	if (event->pid)
+		nla_put_u32(skb, CFI_ATTR_PID, event->pid);
+
+	genlmsg_end(skb, hdr);
+	return genlmsg_multicast(&cfi_genl_family, skb, 0, 0, GFP_ATOMIC);
+}
+
+int cfi_nl_send_mem_migrate_advised(const char *dimm_label)
+{
+	struct sk_buff *skb;
+	void *hdr;
+
+	skb = genlmsg_new(NLMSG_GOODSIZE, GFP_ATOMIC);
+	if (!skb)
+		return -ENOMEM;
+
+	hdr = genlmsg_put(skb, 0, 0, &cfi_genl_family, 0,
+			   CFI_CMD_MEM_MIGRATE_ADVISED);
+	if (!hdr) {
+		nlmsg_free(skb);
+		return -EMSGSIZE;
+	}
+
+	nla_put_u8(skb, CFI_ATTR_DOMAIN, CFI_DOMAIN_MEM);
+	nla_put_string(skb, CFI_ATTR_DIMM_LABEL, dimm_label);
 
 	genlmsg_end(skb, hdr);
 	return genlmsg_multicast(&cfi_genl_family, skb, 0, 0, GFP_ATOMIC);
