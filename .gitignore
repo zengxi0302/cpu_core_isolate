@@ -16,3 +16,7 @@ Module.symvers
 
 # Claude Code local settings
 .claude/
+
+# userspace test tool binaries
+test/tools/cfimon
+test/tools/ownpage

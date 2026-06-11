@@ -109,6 +109,12 @@ bool mfi_page_soft_offline(unsigned long pfn);
 void mfi_page_hard_offline(unsigned long pfn);
 bool mfi_soft_offline_available(void);
 
+/* --- mfi_dimm.c --- */
+int  mfi_dimm_init(void);
+void mfi_dimm_exit(void);
+void mfi_dimm_account(const char *label, bool uce);
+int  mfi_dimm_show(char *buf, size_t len);
+
 /* --- mfi_sysfs.c --- */
 int  mfi_sysfs_init(struct kobject *parent);
 void mfi_sysfs_exit(void);

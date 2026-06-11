@@ -17,7 +17,7 @@
 #include "../include/uapi/cfi.h"
 
 #define CFI_MODULE_NAME		"cpu_fault_isolate"
-#define CFI_VERSION		"0.2.0"
+#define CFI_VERSION		"0.3.0"
 #define CFI_ERROR_LOG_MAX	64	/* Max recent errors per CPU */
 
 /* Forward declarations */

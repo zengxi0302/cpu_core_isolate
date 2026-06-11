@@ -9,6 +9,8 @@
  *     pre_isolate        (rw) - proactive CE-driven soft offline
  *     page_ce_threshold  (rw) - per-page CE count to trigger pre-isolation
  *     window_secs        (rw) - page/DIMM CE sliding window
+ *     dimm_ce_threshold  (rw) - per-DIMM CE count to advise evacuation
+ *     dimm_uce_threshold (rw) - per-DIMM UCE count to advise evacuation
  *     triage             (rw) - Phase-2 kernel-context UCE triage switch
  *     stats              (ro) - counters snapshot (key value per line)
  *     dimms              (ro) - per-DIMM accounting table
@@ -68,6 +70,8 @@ MFI_ATTR_BOOL_RW(enable, mfi_enable);
 MFI_ATTR_BOOL_RW(pre_isolate, mfi_pre_isolate);
 MFI_ATTR_UINT_RW(page_ce_threshold, mfi_page_ce_threshold);
 MFI_ATTR_UINT_RW(window_secs, mfi_window_secs);
+MFI_ATTR_UINT_RW(dimm_ce_threshold, mfi_dimm_ce_threshold);
+MFI_ATTR_UINT_RW(dimm_uce_threshold, mfi_dimm_uce_threshold);
 MFI_ATTR_BOOL_RW(triage, mfi_triage);
 
 static ssize_t stats_show(struct kobject *kobj, struct kobj_attribute *attr,
@@ -95,13 +99,23 @@ static ssize_t stats_show(struct kobject *kobj, struct kobj_attribute *attr,
 }
 static struct kobj_attribute mfi_attr_stats = __ATTR_RO(stats);
 
+static ssize_t dimms_show(struct kobject *kobj, struct kobj_attribute *attr,
+			  char *buf)
+{
+	return mfi_dimm_show(buf, PAGE_SIZE);
+}
+static struct kobj_attribute mfi_attr_dimms = __ATTR_RO(dimms);
+
 static struct attribute *mfi_attrs[] = {
 	&mfi_attr_enable.attr,
 	&mfi_attr_pre_isolate.attr,
 	&mfi_attr_page_ce_threshold.attr,
 	&mfi_attr_window_secs.attr,
+	&mfi_attr_dimm_ce_threshold.attr,
+	&mfi_attr_dimm_uce_threshold.attr,
 	&mfi_attr_triage.attr,
 	&mfi_attr_stats.attr,
+	&mfi_attr_dimms.attr,
 	NULL,
 };
 

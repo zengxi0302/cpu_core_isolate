@@ -297,6 +297,9 @@ void mfi_report_mem_error(const struct mfi_mem_error *err)
 		return;
 	}
 
+	if (err->dimm_label)
+		mfi_dimm_account(err->dimm_label, err->type != MFI_MEM_CE);
+
 	if (err->type == MFI_MEM_CE)
 		mfi_handle_ce(err);
 	else
@@ -425,6 +428,10 @@ int mfi_init(void)
 
 	mfi_detect_cec();
 
+	ret = mfi_dimm_init();
+	if (ret)
+		goto err_page;
+
 	ret = mfi_sysfs_init(cfi_sysfs_root());
 	if (ret) {
 		pr_warn("mem: sysfs init failed: %d (continuing without)\n",
@@ -454,8 +461,10 @@ int mfi_init(void)
 #ifdef CONFIG_X86
 err_sysfs:
 	mfi_sysfs_exit();
-	mfi_page_exit();
+	mfi_dimm_exit();
 #endif
+err_page:
+	mfi_page_exit();
 err_core:
 	mfi_core_exit();
 	return ret;
@@ -471,6 +480,7 @@ void mfi_exit(void)
 	mfi_x86_exit();
 #endif
 	mfi_sysfs_exit();
+	mfi_dimm_exit();
 	mfi_page_exit();
 	mfi_core_exit();
 }

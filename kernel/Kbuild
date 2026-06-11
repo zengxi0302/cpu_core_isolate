@@ -16,6 +16,7 @@ cpu_fault_isolate-y := core/cfi_main.o \
 		       core/cfi_lockup.o \
 		       core/mfi_core.o \
 		       core/mfi_page.o \
+		       core/mfi_dimm.o \
 		       core/mfi_sysfs.o
 
 # Architecture-specific backends
