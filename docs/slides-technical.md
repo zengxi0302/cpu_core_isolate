@@ -1,0 +1,251 @@
+# CPU 核心故障自隔离（CFI）— 技术例会汇报材料
+
+> 适用场景：技术例会、方案评审、架构评审
+> 重点：方案设计、技术难点、实现路径
+
+---
+
+## Slide 1: 问题陈述
+
+**一句话**：单核 CPU Cache 故障导致整机 panic，牵连全部 VM。
+
+```
+现状:  1 个 CPU 核心 Cache UCE  →  mce_panic()  →  整机 100+ VM 全部丢失
+目标:  1 个 CPU 核心 Cache UCE  →  隔离该核心  →  丢失 1 VM，保全 99+ VM
+```
+
+**触发场景**：
+- L1/L2/L3 Cache 不可纠正错误（UCE）
+- CPU 硬锁（NMI watchdog 触发）
+- CPU 软锁（scheduler 停转）
+
+---
+
+## Slide 2: 为什么现有方案不行？
+
+| 方案 | 问题 |
+|------|------|
+| 调高 tolerant sysfs | HCE3 内核**移除了**该 sysfs 属性 |
+| 注册 MCE decode chain | decode chain 在 `mce_panic()` **之后**才走到 |
+| EDAC/rasdaemon | 只做记录，不做隔离决策 |
+| 内核 watchdog | 抑制 panic 后只记日志，不下线 CPU |
+
+**时序图（核心矛盾）**：
+
+```
+MCE 中断
+  └→ do_machine_check()
+       ├→ mce_severity() == PANIC
+       ├→ mce_panic()  ←←←  系统在这里就死了
+       │     └→ panic()
+       │
+       └→ mce_log() → decode chain → CFI  ←←← 走不到这里
+```
+
+---
+
+## Slide 3: 解决方案总览
+
+**三层防御体系**（以内核模块形式实现，不改内核源码）：
+
+```
+┌─────────────────────────────────────────────────────┐
+│ 第1层: Panic 拦截 (模块加载时立即生效)              │
+│   • mce_tolerant=3 (kprobe直写内核变量)             │
+│   • softlockup_panic=0                              │
+│   • hardlockup_panic=0                              │
+├─────────────────────────────────────────────────────┤
+│ 第2层: 错误检测 (全量错误捕获)                      │
+│   • x86: MCE decode chain (高优先级)                │
+│   • x86: HCE3 FMA chain (额外早期通知)              │
+│   • arm64: GHES tracepoint                          │
+│   • 自建: hrtimer + kthread lockup 检测             │
+├─────────────────────────────────────────────────────┤
+│ 第3层: 隔离执行 (确保在健康CPU上执行)               │
+│   • workqueue → remove_cpu()                        │
+│   • 跨CPU调度 (故障CPU可能已不可用)                 │
+│   • Daemon 协作 (给迁移VM留窗口)                    │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+## Slide 4: 关键技术点 — tolerant 直写
+
+**挑战**：HCE3 移除了 tolerant sysfs，`kallsyms_lookup_name()` 5.7+ 不导出。
+
+**方案**：kprobe 符号查找 + 内存直写
+
+```c
+// 1. 利用 kprobe 注册获取符号地址
+struct kprobe kp = { .symbol_name = "mce_tolerant" };
+register_kprobe(&kp);
+int *ptr = (int *)kp.addr;  // 得到内核变量地址
+unregister_kprobe(&kp);
+
+// 2. 直接修改
+*ptr = 3;  // 阻止 mce_panic()
+
+// 3. 模块卸载时恢复
+*ptr = orig_value;
+```
+
+**效果**：`do_machine_check()` 检查 tolerant 时发现 >=3，跳过 `mce_panic()`，UCE 流入 decode chain → CFI notifier → 触发隔离。
+
+---
+
+## Slide 5: 关键技术点 — HCE3 FMA 框架适配
+
+**运行时检测**（无需条件编译，同一 ko 兼容 upstream 和 HCE3）：
+
+```c
+// 探测 HCE3 特有符号
+addr = cfi_lookup_name("fma_register_mce_do_chain");
+if (addr) {
+    // HCE3 内核，注册 FMA 通知链
+    void (*reg)(struct notifier_block *) = (void *)addr;
+    reg(&cfi_fma_nb);
+}
+// 否则跳过，仅用标准 decode chain
+```
+
+**三个 HCE3 钩子**：
+
+| 钩子 | 作用 | CFI 用法 |
+|------|------|---------|
+| `fma_mce_do_chain` | MCE 处理过程中通知 | 早期错误获取 |
+| `mce_panic_chain` | panic 前通知 | 诊断日志 |
+| `mce_tolerant` (变量) | 控制 panic 行为 | 设为 3 阻止 panic |
+
+---
+
+## Slide 6: 关键技术点 — 跨 CPU 隔离
+
+**问题**：故障 CPU 可能处于 hardlockup，无法处理自己的 workqueue。
+
+**方案**：
+
+```c
+if (urgent && current_cpu == faulty_cpu) {
+    // 找一个健康 CPU 来执行 remove_cpu()
+    target = cpumask_any_but(cpu_online_mask, faulty_cpu);
+    queue_work_on(target, system_wq, &offline_work);
+} else {
+    schedule_work(&offline_work);
+}
+```
+
+**remove_cpu() 自动完成**：
+- 迁移所有 runnable task
+- 转移 IRQ 亲和性
+- 停止 per-CPU 内核线程
+- 排空 run queue
+
+---
+
+## Slide 7: 独立 Lockup 检测
+
+抑制内核 watchdog panic 后，CFI 自建检测 + 隔离：
+
+```
+┌────────────────────────────────────────────────┐
+│  Softlockup 检测:                              │
+│    Per-CPU kthread 每4s更新时间戳               │
+│    Per-CPU hrtimer 检查时间戳是否过期(30s)      │
+│    过期 → cfi_report_error(SOFTLOCKUP, UCF)    │
+│                                                │
+│  Hardlockup 检测:                              │
+│    Per-CPU hrtimer 每4s递增 heartbeat           │
+│    Global monitor(另一CPU) 每5s检查所有 hb      │
+│    连续6次(30s)不变 → report(HARDLOCKUP, UCF)  │
+└────────────────────────────────────────────────┘
+          │
+          v  
+   Lockup 直接跳过阈值逻辑 → 立即 ISOLATING
+```
+
+---
+
+## Slide 8: 状态机与阈值逻辑
+
+```
+ONLINE ──[CE >= 10]──> DEGRADED ──[UCE >= 1]──> ISOLATING ──> ISOLATED
+  │                                                  │
+  └──────────[UCE >= 1]──────────────────────────────┘
+  └──────────[Lockup]────────────────────────────────┘ (直接跳过阈值)
+```
+
+**关键参数**（运行时可调）：
+- CE 阈值：10/窗口（默认1小时）
+- UCE 阈值：1（一次即触发）
+- Lockup：无需阈值，单次即隔离
+
+**Daemon 协作**：
+- 非紧急：等 daemon ACK（最多30s），让 daemon 先迁移 VM
+- 紧急（lockup/PCC）：立即下线，不等 daemon
+
+---
+
+## Slide 9: 模块架构与文件组织
+
+```
+cpu_fault_isolate.ko (单一模块，~2500 行 C)
+├── core/
+│   ├── cfi_main.c           # 入口、参数、init 编排
+│   ├── cfi_core.c           # 状态机、阈值引擎
+│   ├── cfi_hotplug.c        # CPU offline/online
+│   ├── cfi_panic_suppress.c # panic 拦截 + HCE3 适配
+│   ├── cfi_lockup.c         # 独立 lockup 检测
+│   ├── cfi_netlink.c        # 用户态通信
+│   ├── cfi_sysfs.c          # sysfs 接口
+│   └── cfi_debugfs.c        # 测试注入
+├── arch/x86/
+│   ├── cfi_x86.c            # MCE handler + FMA
+│   └── cfi_x86_cache.c      # MCA 错误码分类
+└── arch/arm64/
+    ├── cfi_arm64.c           # GHES tracepoint
+    └── cfi_arm64_cache.c     # ARM RAS 分类
+```
+
+---
+
+## Slide 10: 测试验证现状
+
+| 测试项 | 环境 | 结果 |
+|--------|------|------|
+| 模块加载/卸载 | HCE3 VM | ✅ PASS |
+| sysfs 读写 | HCE3 VM | ✅ PASS |
+| debugfs CE 注入 → DEGRADED | HCE3 VM | ✅ PASS |
+| debugfs UCE 注入 → ISOLATED | HCE3 VM | ✅ PASS |
+| mce-inject CE | HCE3 VM | ✅ PASS |
+| mce-inject hw UCE (v0.1) | HCE3 VM | ❌ panic（tolerant 未设成功） |
+| **mce-inject hw UCE (v0.2)** | **HCE3 物理机** | **待验证** |
+
+**v0.2 修复**：kprobe 直写 `mce_tolerant`，预期 dmesg 输出：
+```
+cpu_fault_isolate: set mce_tolerant=3 directly via kallsyms (was 1)
+cpu_fault_isolate: registered on HCE3 fma_mce_do_chain
+```
+
+---
+
+## Slide 11: 后续计划
+
+| 里程碑 | 内容 | 时间 |
+|--------|------|------|
+| **v0.2 验证** | HCE3 物理机 UCE 注入不 panic | 本周 |
+| v0.3 | cfid daemon + VM vCPU 迁移 | 2 周 |
+| v0.4 | SMT sibling 联动、NUMA 感知 | 4 周 |
+| v0.5 | 对接上层调度（Nova/K8s） | 6 周 |
+| v1.0 | RPM 打包、systemd、监控 | 8 周 |
+
+---
+
+## Slide 12: 风险与缓解
+
+| 风险 | 影响 | 缓解 |
+|------|------|------|
+| kprobe 在某些内核配置下禁用 | tolerant 设不上 | 提供内核 patch 作为备选 |
+| tolerant=3 可能掩盖其他 fatal MCE | 理论上降低保护 | CFI 主动处理所有 MCE，比 panic 更精准 |
+| lockup CPU 上的 VM 可能已损坏 | 数据一致性 | 这是 "止损" 而非 "无损"，与直接 panic 相比仍是改善 |
+| 模块 unload 时恢复不完整 | 残留低保护状态 | exit 路径严格恢复所有原值 |
