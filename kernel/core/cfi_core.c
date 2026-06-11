@@ -12,7 +12,7 @@
  *   ONLINE --[UCE >= threshold]--> ISOLATING --> ISOLATED | FAILED
  */
 
-#define pr_fmt(fmt) CFI_MODULE_NAME ": " fmt
+#define pr_fmt(fmt) "cpu_fault_isolate: " fmt
 
 #include <linux/kernel.h>
 #include <linux/slab.h>

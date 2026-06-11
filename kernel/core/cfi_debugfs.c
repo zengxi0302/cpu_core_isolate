@@ -20,7 +20,7 @@
  *   ucf  - Uncorrected Fatal
  */
 
-#define pr_fmt(fmt) CFI_MODULE_NAME ": " fmt
+#define pr_fmt(fmt) "cpu_fault_isolate: " fmt
 
 #include <linux/kernel.h>
 #include <linux/debugfs.h>
@@ -211,9 +211,9 @@ static ssize_t cfi_inject_write(struct file *file, const char __user *ubuf,
 	if (cpu_online(cpu)) {
 		event.socket = topology_physical_package_id(cpu);
 		event.core_id = topology_core_id(cpu);
-#ifdef CONFIG_X86
-		event.thread_id = topology_smt_thread_id(cpu);
-#endif
+		/* First CPU in the SMT sibling mask is thread 0 */
+		event.thread_id =
+			(cpu == cpumask_first(topology_sibling_cpumask(cpu))) ? 0 : 1;
 	}
 
 	pr_info("inject: cpu=%u type=0x%x severity=%u\n",

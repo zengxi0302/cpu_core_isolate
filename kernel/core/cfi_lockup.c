@@ -19,7 +19,7 @@
  *     any CPU whose heartbeat is stale.
  */
 
-#define pr_fmt(fmt) CFI_MODULE_NAME ": " fmt
+#define pr_fmt(fmt) "cpu_fault_isolate: " fmt
 
 #include <linux/kernel.h>
 #include <linux/hrtimer.h>

@@ -17,7 +17,7 @@
  *   CPER sections identified by HiSilicon GUIDs.
  */
 
-#define pr_fmt(fmt) CFI_MODULE_NAME ": " fmt
+#define pr_fmt(fmt) "cpu_fault_isolate: " fmt
 
 #include <linux/kernel.h>
 #include <linux/uuid.h>

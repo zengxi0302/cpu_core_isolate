@@ -17,7 +17,7 @@
  *   - CFI_CMD_ACK_ISOLATE: Daemon confirms pre-isolation steps done
  */
 
-#define pr_fmt(fmt) CFI_MODULE_NAME ": " fmt
+#define pr_fmt(fmt) "cpu_fault_isolate: " fmt
 
 #include <linux/module.h>
 #include <net/genetlink.h>

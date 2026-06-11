@@ -23,10 +23,11 @@
  * Also registers a generic panic notifier as a last-resort logger.
  */
 
-#define pr_fmt(fmt) CFI_MODULE_NAME ": " fmt
+#define pr_fmt(fmt) "cpu_fault_isolate: " fmt
 
 #include <linux/kernel.h>
 #include <linux/notifier.h>
+#include <linux/panic_notifier.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/kprobes.h>

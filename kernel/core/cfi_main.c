@@ -10,7 +10,7 @@
  * Copyright (c) 2026 openEuler Community
  */
 
-#define pr_fmt(fmt) CFI_MODULE_NAME ": " fmt
+#define pr_fmt(fmt) "cpu_fault_isolate: " fmt
 
 #include <linux/module.h>
 #include <linux/kernel.h>
