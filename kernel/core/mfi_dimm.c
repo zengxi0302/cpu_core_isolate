@@ -26,6 +26,7 @@
 #include <ras/ras_event.h>
 #include "cfi_internal.h"
 #include "mfi_internal.h"
+#include "mfi_policy.h"
 
 static DEFINE_SPINLOCK(mfi_dimm_lock);
 static LIST_HEAD(mfi_dimm_list);
@@ -61,7 +62,7 @@ void mfi_dimm_account(const char *label, bool uce)
 {
 	struct mfi_dimm_entry *d;
 	bool advise = false;
-	u64 now, window_ns;
+	u64 now;
 	unsigned long flags;
 	char label_copy[MFI_DIMM_LABEL_LEN];
 
@@ -72,8 +73,8 @@ void mfi_dimm_account(const char *label, bool uce)
 	d = mfi_dimm_get(label);
 	if (d) {
 		now = ktime_get_ns();
-		window_ns = (u64)mfi_window_secs * NSEC_PER_SEC;
-		if (now - d->window_start_ns > window_ns) {
+		if (mfi_window_expired(now, d->window_start_ns,
+				       mfi_window_secs)) {
 			d->ce_count = 0;
 			d->uce_count = 0;
 			d->advised = false;

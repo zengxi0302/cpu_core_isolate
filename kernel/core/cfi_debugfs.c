@@ -22,7 +22,7 @@
  * Usage (memory domain):
  *   echo "domain=mem pfn=0x12345 type=ce" > /sys/kernel/debug/cfi/inject
  *   echo "domain=mem pfn=0x12345 type=uce_srao" > inject
- *   echo "domain=mem pfn=0x12345 type=uce_srar [kernel=1]" > inject
+ *   echo "domain=mem pfn=0x12345 type=uce_srar [kernel=1] [ripv=0] [pcc=1]" > inject
  *
  * Memory injection drives the REAL handling path: the PFN must be
  * valid, threshold crossings actually soft-offline the page, UCEs
@@ -151,6 +151,7 @@ static ssize_t cfi_inject_mem(const char *buf, size_t count)
 	size_t val_len;
 	unsigned long pfn, opt;
 	bool kernel_ctx = false;
+	bool ripv = true, pcc = false;
 	int ret;
 
 	val = find_key(buf, count, "pfn", &val_len);
@@ -184,6 +185,12 @@ static ssize_t cfi_inject_mem(const char *buf, size_t count)
 	val = find_key(buf, count, "kernel", &val_len);
 	if (val && !parse_uint(val, val_len, 10, &opt))
 		kernel_ctx = !!opt;
+	val = find_key(buf, count, "ripv", &val_len);
+	if (val && !parse_uint(val, val_len, 10, &opt))
+		ripv = !!opt;
+	val = find_key(buf, count, "pcc", &val_len);
+	if (val && !parse_uint(val, val_len, 10, &opt))
+		pcc = !!opt;
 
 	err.pfn = pfn;
 	err.addr = (u64)pfn << PAGE_SHIFT;
@@ -192,8 +199,14 @@ static ssize_t cfi_inject_mem(const char *buf, size_t count)
 	if (kernel_ctx)
 		err.flags |= MFI_EVF_KERNEL_CTX;
 
-	pr_info("inject: mem: pfn=0x%lx type=%d kernel=%d\n",
-		pfn, err.type, kernel_ctx);
+	pr_info("inject: mem: pfn=0x%lx type=%d kernel=%d ripv=%d pcc=%d\n",
+		pfn, err.type, kernel_ctx, ripv, pcc);
+
+	/* Mirror the x86 backend's flow, including the triage gate */
+	if (err.type == MFI_MEM_UCE_CONSUMED && kernel_ctx && mfi_triage) {
+		if (mfi_triage_kernel_uce(pfn, ripv, pcc, err.cpu))
+			err.flags |= MFI_EVF_TRIAGED;
+	}
 
 	mfi_report_mem_error(&err);
 	return count;
@@ -351,7 +364,7 @@ static int cfi_inject_help_show(struct seq_file *m, void *v)
 	seq_puts(m, "\nMemory domain:\n");
 	seq_puts(m, "  echo \"domain=mem pfn=0x12345 type=ce\" > inject\n");
 	seq_puts(m, "  types: ce, uce_srao, uce_srar\n");
-	seq_puts(m, "  options: kernel=0|1\n");
+	seq_puts(m, "  options: kernel=0|1 ripv=0|1 pcc=0|1\n");
 	seq_puts(m, "  WARNING: drives the real page isolation path\n");
 
 	return 0;

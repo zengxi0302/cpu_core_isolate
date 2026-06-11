@@ -96,6 +96,22 @@ static int mfi_x86_mce_notifier(struct notifier_block *nb,
 	pr_debug("mem: MCE bank %d mcacod=0x%04x pfn=0x%lx type=%d kctx=%d\n",
 		 m->bank, mcacod, err.pfn, err.type, kernel_ctx);
 
+	/*
+	 * Phase-2 triage: a UCE consumed in kernel context has no safe
+	 * default once panic suppression is active. Hand the verdict to
+	 * the triage engine before regular accounting; it either queues
+	 * recovery (we tag the event TRIAGED so mfi_core does not queue
+	 * a duplicate) or escalates to a controlled panic and never
+	 * returns.
+	 */
+	if (err.type == MFI_MEM_UCE_CONSUMED && kernel_ctx && mfi_triage) {
+		if (mfi_triage_kernel_uce(err.pfn,
+					  !!(m->mcgstatus & MCG_STATUS_RIPV),
+					  !!(m->status & MCI_STATUS_PCC),
+					  err.cpu))
+			err.flags |= MFI_EVF_TRIAGED;
+	}
+
 	mfi_report_mem_error(&err);
 
 	/* Never NOTIFY_STOP: let EDAC/mcelog also see the record */

@@ -20,3 +20,4 @@ Module.symvers
 # userspace test tool binaries
 test/tools/cfimon
 test/tools/ownpage
+test/unit/test_mfi_policy

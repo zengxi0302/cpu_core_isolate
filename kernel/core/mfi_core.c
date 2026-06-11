@@ -27,6 +27,7 @@
 #include <linux/kprobes.h>
 #include "cfi_internal.h"
 #include "mfi_internal.h"
+#include "mfi_policy.h"
 
 struct mfi_stats mfi_stats;
 
@@ -180,7 +181,7 @@ static void mfi_handle_ce(const struct mfi_mem_error *err)
 	struct mfi_page_entry *e;
 	enum mfi_page_state state = MFI_PAGE_WATCHED;
 	bool offline = false;
-	u64 now, window_ns;
+	u64 now;
 	u32 ce_count = 1;
 	unsigned long flags;
 
@@ -190,8 +191,8 @@ static void mfi_handle_ce(const struct mfi_mem_error *err)
 	e = mfi_page_get(err->pfn);
 	if (e) {
 		now = ktime_get_ns();
-		window_ns = (u64)mfi_window_secs * NSEC_PER_SEC;
-		if (now - e->window_start_ns > window_ns) {
+		if (mfi_window_expired(now, e->window_start_ns,
+				       mfi_window_secs)) {
 			e->ce_count = 0;
 			e->window_start_ns = now;
 		}
@@ -199,9 +200,10 @@ static void mfi_handle_ce(const struct mfi_mem_error *err)
 		e->last_seen_ns = now;
 		ce_count = e->ce_count;
 
-		if (e->state == MFI_PAGE_WATCHED &&
-		    mfi_pre_isolate && mfi_soft_offline_available() &&
-		    e->ce_count >= mfi_page_ce_threshold) {
+		if (mfi_pre_isolate_decide(e->ce_count, mfi_page_ce_threshold,
+					   e->state == MFI_PAGE_WATCHED,
+					   mfi_pre_isolate,
+					   mfi_soft_offline_available())) {
 			e->state = MFI_PAGE_PRE_ISO;
 			offline = true;
 		}
@@ -272,6 +274,10 @@ static void mfi_handle_uce(const struct mfi_mem_error *err)
 				    err->pfn);
 		return;
 	}
+
+	/* Triage already queued recovery for this page */
+	if (err->flags & MFI_EVF_TRIAGED)
+		return;
 
 	if (queue_offline) {
 		pr_warn("mem: pfn 0x%lx %s UCE, queueing memory_failure\n",

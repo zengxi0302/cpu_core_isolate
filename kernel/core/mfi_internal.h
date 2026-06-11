@@ -115,6 +115,15 @@ void mfi_dimm_exit(void);
 void mfi_dimm_account(const char *label, bool uce);
 int  mfi_dimm_show(char *buf, size_t len);
 
+/* --- mfi_triage.c (Phase 2) --- */
+/*
+ * Triage a kernel-context consumed UCE. Returns true if the error was
+ * recovered (page offline queued, owner killed); does not return if the
+ * verdict is panic.
+ */
+bool mfi_triage_kernel_uce(unsigned long pfn, u64 ripv, u64 pcc,
+			   unsigned int cpu);
+
 /* --- mfi_sysfs.c --- */
 int  mfi_sysfs_init(struct kobject *parent);
 void mfi_sysfs_exit(void);
