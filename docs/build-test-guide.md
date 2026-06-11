@@ -10,6 +10,7 @@
 6. [测试验证流程](#6-测试验证流程)
 7. [测试矩阵](#7-测试矩阵)
 8. [常见问题排查](#8-常见问题排查)
+9. [内存故障域（MFI）测试](#9-内存故障域mfi测试)
 
 ---
 
@@ -355,20 +356,10 @@ dmesg | tail -3
 **风险**: 无（纯软件模拟，不触发真实硬件错误）
 **限制**: 不经过真实硬件错误路径，只测试模块内部逻辑
 
-> **注意**: 当前代码中 debugfs inject 接口尚未实现，需要先添加。
-> 以下是需要添加到内核模块中的 debugfs 注入支持代码。
+> debugfs 注入接口已实现（`kernel/core/cfi_debugfs.c`），同时支持
+> CPU 域和内存域（见第 9 章）。
 
-#### 需要添加的 debugfs 注入代码
-
-在 `kernel/core/` 下新增 `cfi_debugfs.c`:
-
-```c
-// 文件: kernel/core/cfi_debugfs.c
-// 提供 /sys/kernel/debug/cfi/inject 接口用于软件模拟错误注入
-// 详细实现见后续开发
-```
-
-添加后的使用方式：
+使用方式：
 
 ```bash
 # 挂载 debugfs (通常已自动挂载)
@@ -1105,6 +1096,7 @@ echo "=== Edge cases complete ==="
 └─────────────────────────────────────────────────────────┘
 ```
 
+
 ---
 
 ## 8. 常见问题排查
@@ -1232,18 +1224,132 @@ cat /proc/interrupts  # 检查绑定到目标 CPU 的中断
 
 ---
 
-## 附录 A: 需要补充实现的 debugfs 注入接口
+## 9. 内存故障域（MFI）测试
 
-当前代码尚未包含 debugfs 软件注入接口。这是进行虚拟机测试的前提条件。
-需要新增文件 `kernel/core/cfi_debugfs.c` 并修改 `Kbuild` 和 `cfi_internal.h`。
+v0.2 起模块包含内存故障域（设计见 `memory-fault-isolation-design.md`）。
 
-关键实现要点：
-1. 在 `/sys/kernel/debug/cfi/inject` 创建一个 write-only 文件
-2. 解析格式: `cpu=N type=<type> severity=<sev>`
-3. 构造 `struct cfi_error_event` 并调用 `cfi_report_error()`
-4. 在 `cfi_main.c` 的 init/exit 中调用 debugfs 的 init/exit
+### 9.1 加载参数与 sysfs
 
-这将是下一步开发的优先项。
+```bash
+sudo insmod cpu_fault_isolate.ko \
+    mem_enable=1 mem_pre_isolate=1 \
+    page_ce_threshold=3 mem_window_secs=300 \
+    dimm_ce_threshold=100 dimm_uce_threshold=3 \
+    mem_triage=0          # Phase-2 甄别默认关闭
+
+ls /sys/kernel/cfi/mem/
+# enable pre_isolate page_ce_threshold window_secs
+# dimm_ce_threshold dimm_uce_threshold triage stats dimms
+
+cat /sys/kernel/cfi/mem/stats
+# ce_total / uce_async / uce_consumed / pages_watched /
+# pages_pre_offlined / pages_offlined / pages_failed /
+# triage_saved / triage_panic / soft_offline_available
+```
+
+加载日志关注两行：
+
+```
+cpu_fault_isolate: mem: soft_offline_page resolved, pre-isolation available
+cpu_fault_isolate: mem: memory fault domain active (...)
+# 若检测到 RAS CEC:
+cpu_fault_isolate: mem: RAS CEC detected, pre-isolation downgraded to accounting-only
+```
+
+### 9.2 软件注入（VM 即可）
+
+```bash
+# 编译用户态工具
+make -C test/tools          # cfimon (netlink 监视) + ownpage (取靶页)
+
+# 终端 1: 监听事件
+sudo test/tools/cfimon
+
+# 终端 2: CE 阈值 -> 预隔离（soft offline，无进程被杀）
+sudo test/inject/mem_inject.sh --type ce --count 3
+
+# 异步 UCE -> memory_failure 页隔离
+sudo test/inject/mem_inject.sh --type uce_srao
+
+# 消费型 UCE（用户态语义，由内核 rmap 杀属主，helper 进程收 SIGBUS）
+sudo test/inject/mem_inject.sh --type uce_srar
+
+# 查询统计（netlink 通道验证）
+sudo test/tools/cfimon --mem-status
+```
+
+预期事件序列（cfimon 输出）：
+
+```
+[MEM_ERROR] pfn=0x... type=CE state=watched ce=1 ...
+[MEM_ERROR] pfn=0x... type=CE state=pre_isolating ce=3 ...
+[MEM_PAGE_OFFLINED] pfn=0x... state=offlined flags=0x2(PRE_ISOLATE)
+```
+
+### 9.3 Phase-2 甄别测试（物理机/牺牲 VM）
+
+⚠️ **panic 判决会真的 panic**，仅在可丢弃的测试机上执行。
+
+```bash
+echo 1 > /sys/kernel/cfi/mem/triage
+
+# 用户页 + RIPV=1 -> RECOVER（杀属主 + 页隔离 + MEM_VM_KILLED 事件）
+echo "domain=mem pfn=<ownpage的pfn> type=uce_srar kernel=1" > \
+    /sys/kernel/debug/cfi/inject
+
+# RIPV=0 -> 受控 panic（kdump 验证现场保留）
+echo "domain=mem pfn=<pfn> type=uce_srar kernel=1 ripv=0" > inject
+```
+
+纯决策逻辑有主机侧单元测试，不需要内核：
+
+```bash
+make -C test/unit run       # 18 个用例：甄别判决表 / 预隔离门控 / 窗口
+```
+
+### 9.4 EINJ 内存错误硬注入（物理机）
+
+```bash
+# 0x00000008 Memory Correctable        -> CE 记账（mc_event 通路）
+# 0x00000010 Memory Uncorrectable non-fatal -> SRAO 页隔离，不 panic
+# 0x00000020 Memory Uncorrectable fatal     -> 甄别/受控 panic 路径
+echo 0x00000008 > /sys/kernel/debug/apei/einj/error_type
+# param1/param2 可指定物理地址/掩码，定向到指定 VM 的内存
+echo 1 > /sys/kernel/debug/apei/einj/error_inject
+cat /sys/kernel/cfi/mem/stats
+cat /sys/kernel/cfi/mem/dimms
+```
+
+### 9.5 MFI 测试矩阵
+
+| # | 测试项 | 注入方式 | VM | 物理机 | 状态 |
+|---|--------|----------|:--:|:--:|------|
+| M1 | mem sysfs 读写 | 无 | ✅ | ✅ | 待跑（代码就绪） |
+| M2 | CE 计数 + 窗口重置 | debugfs | ✅ | ✅ | 待跑 |
+| M3 | CE 阈值 -> soft offline | debugfs | ✅ | ✅ | 待跑 |
+| M4 | uce_srao -> memory_failure | debugfs | ✅ | ✅ | 待跑 |
+| M5 | netlink MEM_* 事件 (cfimon) | debugfs | ✅ | ✅ | 待跑 |
+| M6 | 甄别判决表 | 主机单测 | ✅ | ✅ | **已通过 (18/18)** |
+| M7 | madvise(MADV_HWPOISON) 通路 | madvise | ✅ | ✅ | 待跑 |
+| M8 | CEC 共存降级 | 无 | - | ✅ | 待跑 |
+| M9 | EINJ Memory CE/UCE | EINJ | ❌ | ✅ | 待跑 |
+| M10 | DIMM 阈值 -> MIGRATE_ADVISED | EINJ | ❌ | ✅ | 待跑 |
+| M11 | 甄别 RECOVER/panic 实机验证 | debugfs/EINJ | ⚠️ | ✅ | 待跑 |
+
+> 本仓库当前开发环境（容器，无法 insmod）已完成：模块对 6.8 头文件
+> 零警告编译、用户态工具编译与基础行为、策略单元测试全绿。
+> M1-M5/M7 需要一台可加载模块的 VM，M8-M11 需要物理机。
+
+---
+
+## 附录 A: debugfs 注入接口（已实现）
+
+`kernel/core/cfi_debugfs.c` 已提供 `/sys/kernel/debug/cfi/inject`：
+
+- CPU 域: `cpu=N type=<type> severity=<sev>` → `cfi_report_error()`
+- 内存域: `domain=mem pfn=0xN type=<ce|uce_srao|uce_srar> [kernel=] [ripv=] [pcc=]`
+  → `mfi_report_mem_error()` / `mfi_triage_kernel_uce()`
+- `cat /sys/kernel/debug/cfi/help` 查看完整说明
 
 ---
 

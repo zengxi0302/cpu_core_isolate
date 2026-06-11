@@ -1,9 +1,9 @@
 # 内存故障自隔离（MFI）— 技术设计文档
 
-**版本**: 0.1.0（草案）
+**版本**: 0.4.0
 **日期**: 2026-06
 **作者**: openEuler Community
-**状态**: 设计评审中
+**状态**: Phase 1/2 内核实现完成（v0.2–v0.4），软件路径自测通过，实机验证中
 **关联**: 本文档是 CFI（CPU 核心故障自隔离）项目的扩展，复用其框架，详见 `design-document.md`
 
 ---
@@ -224,18 +224,33 @@ SRAO 在 `tolerant>=1` 时 uc_decode 也会走到。**MFI 在这里的角色是�
 与 CFI 的 CPU 状态机不同点：页是海量对象，状态只在哈希表内维护，
 OFFLINED 后从表中移除（内核 HWPoison 标记是持久事实来源）。
 
-### 4.5 模块组成（新增文件）
+### 4.5 模块组成（实际落地）
 
-| 文件 | 职责 | 预估行数 |
-|------|------|---------|
-| `core/mfi_core.c` | 页哈希表、状态机、阈值逻辑 | ~300 |
-| `core/mfi_page.c` | soft offline / memory_failure_queue 封装、回执处理 | ~200 |
-| `core/mfi_dimm.c` | DIMM/rank 记账 | ~180 |
-| `core/mfi_sysfs.c` | /sys/kernel/cfi/mem/ 子树 | ~200 |
-| `arch/x86/mfi_x86.c` | MCACOD 内存错误分类（SRAO/SRAR/AO 判定） | ~180 |
-| `arch/arm64/mfi_arm64.c` | CPER Memory Error Section 解码、deferred 判定 | ~180 |
-| `core/cfi_netlink.c`（扩展） | MEM_* 命令与 domain 属性 | +120 |
-| `core/cfi_debugfs.c`（扩展） | 内存错误软件注入 | +80 |
+| 文件 | 职责 |
+|------|------|
+| `core/mfi_core.c` | 页哈希表（256 桶/1024 上限/LRU）、状态机、域 init/exit、CEC 检测 |
+| `core/mfi_page.c` | soft offline（kprobe 解析符号）/ memory_failure_queue / memory_failure_event 回执 |
+| `core/mfi_dimm.c` | DIMM/rank 记账 + `ras:mc_event` 探针（兼作 arm64 地址来源） |
+| `core/mfi_triage.c` | Phase-2 落点甄别（页归属分类 + 判决执行） |
+| `core/mfi_policy.h` | 纯决策函数（甄别判决/预隔离门控/窗口），与主机单测共享 |
+| `core/mfi_sysfs.c` | /sys/kernel/cfi/mem/ 子树 |
+| `arch/x86/mfi_x86.c` | MCACOD 内存错误分类（SRAO/SRAR/deferred 判定）、甄别入口 |
+| `core/cfi_netlink.c`（扩展） | MEM_* 命令与 domain 属性 |
+| `core/cfi_debugfs.c`（扩展） | 内存错误软件注入（含 ripv/pcc 旋钮） |
+| `test/tools/cfimon.c` | 零依赖 genetlink 监视器 / MEM_GET_STATUS 客户端（cfid 参考实现） |
+| `test/tools/ownpage.c` | 注入靶页辅助（mmap+mlock+pagemap） |
+| `test/unit/test_mfi_policy.c` | 策略单测（18 用例，已全绿） |
+
+实现偏差说明：
+
+- **未新增 `arch/arm64/mfi_arm64.c`**：arm64 的内存错误经
+  `ghes_edac → ras:mc_event`（带地址与 DIMM label）和
+  `memory_failure_event` 回执两个公共探针即可覆盖，GHES 自身已对毒页
+  调用 `memory_failure_queue`，Phase 1 无需独立后端。
+- **跨域修正**：CPU 域 x86 分类器原本会把内存 MCACOD 落入
+  GENERIC_CORE 兜底并计入 CPU 计数（坏 DIMM 可拖垮健康核），已在
+  `cfi_x86.h` 提取共享的 `cfi_x86_is_memory_errcode()` 并让 CPU 域
+  显式忽略内存错误。
 
 ---
 
@@ -253,6 +268,11 @@ decode chain。**这对场景 E 是危险的**——必须由 MFI 的甄别逻�
 2. 有 fixup 的 SRAR → 内核自行恢复，MFI 只记账
 3. **无 fixup 的 SRAR，且毒页是用户页/虚机页，且 RIPV=1**
    （x86：`MCG_STATUS.RIPV` 置位，返回地址有效）→ 甄别处置
+
+判决的纯逻辑实现在 `mfi_policy.h::mfi_triage_decide()`，由
+`test/unit/test_mfi_policy.c` 按本节判决表全覆盖验证。补充一个实现
+细化：buddy 空闲页（`MFI_PG_FREE`）也允许 RECOVER——没有活映射消费
+它，直接隔离即可。
 
 ### 5.2 甄别流程
 
@@ -329,12 +349,10 @@ ko 无法为既有代码添加异常表项，以下路径的恢复能力需要�
 
 ```
 /sys/kernel/cfi/mem/
-    enable, pre_isolate, page_ce_threshold, window_secs, triage
-    stats/                    # 全局统计
-        pages_watched, pages_offlined, pages_failed,
-        uce_consumed, uce_async, triage_saved, triage_panic
-    dimm/<label>/             # 介质级
-        ce_count, uce_count, state
+    enable, pre_isolate, page_ce_threshold, window_secs,
+    dimm_ce_threshold, dimm_uce_threshold, triage
+    stats                     # 全局统计（key value 每行一项）
+    dimms                     # 介质级表（label ce= uce= [migrate-advised]）
 ```
 
 ### 7.3 Generic Netlink（family "CFI" 扩展）
@@ -423,10 +441,14 @@ echo "domain=mem pfn=0x12345 type=uce_srao" > /sys/kernel/debug/cfi/inject
 
 ## 11. 里程碑
 
-| 版本 | 内容 |
-|------|------|
-| v0.1 | 本设计文档评审定稿 |
-| v0.2 | Phase 1 实现：页记账 + 预隔离 + SRAO 兜底 + netlink/sysfs |
-| v0.3 | DIMM 记账 + cfid 内存事件处理 + EINJ 物理机验证 |
-| v0.4 | Phase 2 实现：落点甄别（x86 first，灰度开关） |
-| v0.5 | Phase 3 补丁系列首批（页迁移 MC-safe）提交 openEuler |
+| 版本 | 内容 | 状态 |
+|------|------|------|
+| v0.1 | 本设计文档评审定稿 | 完成 |
+| v0.2 | Phase 1 实现：页记账 + 预隔离 + SRAO 兜底 + netlink/sysfs | **完成**（6.8 头文件零警告编译） |
+| v0.3 | DIMM 记账 + cfimon（cfid 参考实现）+ 注入脚本 | **完成**（EINJ 物理机验证待执行） |
+| v0.4 | Phase 2 实现：落点甄别（x86 first，灰度开关）+ 策略单测 | **完成**（单测 18/18 通过） |
+| v0.5 | Phase 3 补丁系列首批（页迁移 MC-safe）提交 openEuler | 未开始 |
+
+当前验证状态详见 `build-test-guide.md` 第 9 章 MFI 测试矩阵：软件路径
+（编译、工具、策略单测）已在开发环境完成；模块加载类用例需要可
+insmod 的 VM；EINJ/甄别实机用例需要物理机。
