@@ -20,7 +20,12 @@
 set -u
 cd "$(dirname "$0")/.."
 REPO=$(pwd)
-REPORT=/root/cfi_validation_report.txt
+# All logs on persistent disk (not /tmp) so they survive an unexpected reboot.
+LOGDIR=/home/cfi_logs
+mkdir -p "$LOGDIR"
+REPORT="$LOGDIR/cfi_validation_report.txt"
+MONLOG="$LOGDIR/cfimon.log"
+MEMLOG="$LOGDIR/cfimem.log"
 KDIR=/lib/modules/$(uname -r)/build
 INJ=/sys/kernel/debug/cfi/inject
 MEM=/sys/kernel/cfi/mem
@@ -133,21 +138,21 @@ echo 60 > /sys/kernel/cfi/window_secs
 
 # ---------- P3 netlink ----------
 hdr "P3 netlink protocol"
-./test/tools/cfimon > /tmp/cfimon.log 2>&1 &
+./test/tools/cfimon > "$MONLOG" 2>&1 &
 MONPID=$!; sleep 1
 if kill -0 $MONPID 2>/dev/null; then
     echo "cpu=1 type=cache_l2 severity=ce" > $INJ; sleep 1
-    grep -q "CPU_ERROR" /tmp/cfimon.log && ok "CPU_ERROR multicast received" || bad "no CPU_ERROR event"
+    grep -q "CPU_ERROR" "$MONLOG" && ok "CPU_ERROR multicast received" || bad "no CPU_ERROR event"
 else
-    bad "cfimon failed to resolve family: $(cat /tmp/cfimon.log)"
+    bad "cfimon failed to resolve family: $(cat "$MONLOG")"
 fi
-./test/tools/cfimon --mem-status > /tmp/cfimem.log 2>&1 \
-    && ok "MEM_GET_STATUS round-trip: $(grep ce_total /tmp/cfimem.log)" || bad "MEM_GET_STATUS failed"
+./test/tools/cfimon --mem-status > "$MEMLOG" 2>&1 \
+    && ok "MEM_GET_STATUS round-trip: $(grep ce_total "$MEMLOG")" || bad "MEM_GET_STATUS failed"
 
 # ---------- P4 MFI 页记账/预隔离/异步 UCE ----------
 hdr "P4 MFI page accounting & isolation"
-./test/tools/ownpage > /tmp/op1.txt & OP1=$!; sleep 1
-PFN1=$(sed 's/pfn=//' /tmp/op1.txt)
+./test/tools/ownpage > "$LOGDIR/op1.txt" & OP1=$!; sleep 1
+PFN1=$(sed 's/pfn=//' "$LOGDIR/op1.txt")
 if [[ -n "$PFN1" ]]; then
     for i in 1 2 3; do echo "domain=mem pfn=$PFN1 type=ce" > $INJ; done
     sleep 3
@@ -161,14 +166,14 @@ if [[ -n "$PFN1" ]]; then
         FAILED=$(awk '/pages_failed/{print $2}' $MEM/stats)
         [[ "$FAILED" -ge 1 ]] && skip "soft offline failed (page pinned? pages_failed=$FAILED)" || bad "no pre-isolation action"
     fi
-    grep -q "MEM_ERROR" /tmp/cfimon.log && ok "MEM_ERROR events on netlink" || bad "no MEM_ERROR events"
+    grep -q "MEM_ERROR" "$MONLOG" && ok "MEM_ERROR events on netlink" || bad "no MEM_ERROR events"
 else
     bad "ownpage produced no pfn"
 fi
 kill $OP1 2>/dev/null
 
-./test/tools/ownpage > /tmp/op2.txt & OP2=$!; sleep 1
-PFN2=$(sed 's/pfn=//' /tmp/op2.txt)
+./test/tools/ownpage > "$LOGDIR/op2.txt" & OP2=$!; sleep 1
+PFN2=$(sed 's/pfn=//' "$LOGDIR/op2.txt")
 echo "domain=mem pfn=$PFN2 type=uce_srao" > $INJ; sleep 3
 UA=$(awk '/uce_async/{print $2}' $MEM/stats)
 OFF=$(awk '/pages_offlined/{print $2}' $MEM/stats)
@@ -188,36 +193,47 @@ kill $OP2 2>/dev/null
 # ---------- P5 madvise 真实毒页 ----------
 hdr "P5 real consumption path (madvise MADV_HWPOISON)"
 sysctl -w vm.memory_failure_early_kill=1 >/dev/null 2>&1
-./test/tools/ownpage --poison > /tmp/op3.txt 2>&1
+./test/tools/ownpage --poison > "$LOGDIR/op3.txt" 2>&1
 RC=$?
 if [[ $RC -ge 128 ]] && [[ $((RC-128)) -eq 7 ]]; then
     ok "madvise poison -> SIGBUS on consumption (real memory_failure path)"
-elif grep -qE "Operation not supported|Invalid argument" /tmp/op3.txt; then
+elif grep -qE "Operation not supported|Invalid argument" "$LOGDIR/op3.txt"; then
     skip "MADV_HWPOISON unsupported on this kernel config"
 else
-    bad "unexpected poison result rc=$RC: $(cat /tmp/op3.txt)"
+    bad "unexpected poison result rc=$RC: $(cat "$LOGDIR/op3.txt")"
 fi
-grep -q "MEM_PAGE_OFFLINED\|MEM_ERROR" /tmp/cfimon.log && ok "kernel-initiated poison visible to MFI accounting" \
+grep -q "MEM_PAGE_OFFLINED\|MEM_ERROR" "$MONLOG" && ok "kernel-initiated poison visible to MFI accounting" \
     || log "  [INFO] poison event not in netlink log (tracepoint availability?)"
 
 # ---------- P6 甄别 RECOVER ----------
 hdr "P6 triage RECOVER path"
 echo 1 > $MEM/triage
-./test/tools/ownpage > /tmp/op4.txt & OP4=$!; sleep 1
-PFN4=$(sed 's/pfn=//' /tmp/op4.txt)
+./test/tools/ownpage > "$LOGDIR/op4.txt" & OP4=$!; sleep 1
+PFN4=$(sed 's/pfn=//' "$LOGDIR/op4.txt")
 echo "domain=mem pfn=$PFN4 type=uce_srar kernel=1" > $INJ; sleep 3
 TS=$(awk '/triage_saved/{print $2}' $MEM/stats)
 TP=$(awk '/triage_panic/{print $2}' $MEM/stats)
 [[ "$TS" -ge 1 ]] && ok "kernel-ctx UCE on user page -> RECOVER (triage_saved=$TS)" || bad "triage_saved=$TS"
 [[ "$TP" == 0 ]] && ok "no spurious panic verdict (triage_panic=0)" || bad "triage_panic=$TP"
 kill -0 $OP4 2>/dev/null && log "  [INFO] owner pending kill (async rmap)" || ok "owner process killed"
-grep -q "MEM_VM_KILLED" /tmp/cfimon.log && ok "MEM_VM_KILLED event emitted" || bad "no MEM_VM_KILLED event"
+grep -q "MEM_VM_KILLED" "$MONLOG" && ok "MEM_VM_KILLED event emitted" || bad "no MEM_VM_KILLED event"
 kill $OP4 2>/dev/null
 echo 0 > $MEM/triage
 
 # ---------- P8 卸载 ----------
 hdr "P8 unload & restore"
 kill $MONPID 2>/dev/null
+# Re-online any CPU我们在 P2 中隔离的，避免 unload 时该 CPU 的 per-CPU hrtimer
+# 仍处于已被热插拔代码迁移到别的 CPU timerqueue 的状态。
+sync
+for c in $(seq 0 $((NC-1))); do
+    if [[ -e /sys/devices/system/cpu/cpu$c/online ]] && \
+       [[ $(cat /sys/devices/system/cpu/cpu$c/online) == 0 ]]; then
+        log "  re-onlining cpu$c before unload"
+        echo 1 > /sys/devices/system/cpu/cpu$c/online || true
+    fi
+done
+sleep 1
 if rmmod cpu_fault_isolate >>"$REPORT" 2>&1; then
     ok "rmmod clean"
     [[ ! -f /sys/kernel/cfi/version ]] && ok "sysfs cleaned up" || bad "sysfs残留"
@@ -226,9 +242,17 @@ if rmmod cpu_fault_isolate >>"$REPORT" 2>&1; then
 else
     bad "rmmod failed: $(dmesg | tail -3)"
 fi
-# 重载稳定性
-insmod kernel/cpu_fault_isolate.ko defer_to_daemon=0 >>"$REPORT" 2>&1 \
-    && rmmod cpu_fault_isolate && ok "reload cycle stable" || bad "reload cycle failed"
+# 重载稳定性 — 用与第一次相同的测试 thresholds，避免重载后默认 window 误差
+sync; sleep 1
+if insmod kernel/cpu_fault_isolate.ko ce_threshold=3 uce_threshold=1 \
+        window_secs=60 defer_to_daemon=0 page_ce_threshold=3 \
+        mem_window_secs=300 dimm_uce_threshold=2 mem_triage=0 >>"$REPORT" 2>&1; then
+    sleep 1
+    rmmod cpu_fault_isolate >>"$REPORT" 2>&1 && ok "reload cycle stable" \
+        || bad "reload-2 rmmod failed: $(dmesg | tail -5)"
+else
+    bad "reload-2 insmod failed: $(dmesg | tail -5)"
+fi
 
 # ---------- P7 (可选) 甄别 PANIC ----------
 if [[ $WITH_PANIC == 1 ]]; then
@@ -238,8 +262,8 @@ if [[ $WITH_PANIC == 1 ]]; then
     log "  injecting kernel-ctx UCE with RIPV=0 -> expect controlled panic + reboot"
     log "  AFTER REBOOT verify: journalctl -k -b -1 | grep 'MFI: unrecoverable'"
     sync; sleep 1
-    ./test/tools/ownpage > /tmp/op5.txt & sleep 1
-    PFN5=$(sed 's/pfn=//' /tmp/op5.txt)
+    ./test/tools/ownpage > "$LOGDIR/op5.txt" & sleep 1
+    PFN5=$(sed 's/pfn=//' "$LOGDIR/op5.txt")
     echo "domain=mem pfn=$PFN5 type=uce_srar kernel=1 ripv=0" > $INJ
     sleep 30
     bad "still alive 30s after panic verdict — suppression not working as designed"
@@ -248,6 +272,7 @@ fi
 # ---------- 汇总 ----------
 hdr "SUMMARY"
 log "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
-log "report: $REPORT   netlink log: /tmp/cfimon.log"
+log "report: $REPORT   netlink log: $MONLOG"
+log "all artifacts persist under $LOGDIR (survives reboot)"
 [[ $FAIL == 0 ]] && log "RESULT: ALL GREEN" || log "RESULT: $FAIL FAILURE(S) — see above"
 exit $FAIL
