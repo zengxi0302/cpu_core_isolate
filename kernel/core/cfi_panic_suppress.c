@@ -26,8 +26,11 @@
 #define pr_fmt(fmt) "cpu_fault_isolate: " fmt
 
 #include <linux/kernel.h>
+#include <linux/version.h>
 #include <linux/notifier.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
 #include <linux/panic_notifier.h>
+#endif
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/kprobes.h>
@@ -35,7 +38,26 @@
 
 #define PROC_SOFTLOCKUP_PANIC	"/proc/sys/kernel/softlockup_panic"
 #define PROC_HARDLOCKUP_PANIC	"/proc/sys/kernel/hardlockup_panic"
-#define SYSFS_MCE_TOLERANT	"/sys/devices/system/machinecheck/machinecheck0/tolerant"
+#define SYSFS_MCE_TOLERANT_FMT	"/sys/devices/system/machinecheck/machinecheck%u/tolerant"
+
+/*
+ * tolerant is mirrored on /sys/devices/system/machinecheck/machinecheckN/
+ * for every CPU but they all read/write the same global mca_cfg.tolerant
+ * variable. We just need a path that exists right now; pick the first
+ * online CPU so module load doesn't fail if cpu0 happens to be offline
+ * (e.g. cpu0 was isolated by an earlier CFI incarnation and we got reloaded).
+ * On exit we reuse the same path; if that CPU went offline meanwhile we try
+ * another, and finally fall back to direct variable write.
+ */
+static int cfi_mce_tolerant_path(char *buf, size_t buflen)
+{
+	int cpu = cpumask_first(cpu_online_mask);
+
+	if (cpu >= nr_cpu_ids)
+		return -ENOENT;
+	snprintf(buf, buflen, SYSFS_MCE_TOLERANT_FMT, cpu);
+	return 0;
+}
 
 static int orig_softlockup_panic = -1;
 static int orig_hardlockup_panic = -1;
@@ -267,25 +289,31 @@ int cfi_suppress_init(void)
 	 * Method 1: sysfs (standard upstream kernels)
 	 * Method 2: direct variable write via kprobe (HCE3 fallback)
 	 */
-	ret = cfi_read_int_file(SYSFS_MCE_TOLERANT, &val);
-	if (ret == 0) {
-		orig_mce_tolerant = val;
-		if (val < (int)cfi_mce_tolerant) {
-			ret = cfi_write_int_file(SYSFS_MCE_TOLERANT,
-						 cfi_mce_tolerant);
-			if (ret == 0) {
-				pr_info("set MCE tolerant=%u via sysfs (was %d)\n",
-					cfi_mce_tolerant, val);
-				tolerant_set = true;
+	{
+		char tolerant_path[64];
+
+		ret = cfi_mce_tolerant_path(tolerant_path, sizeof(tolerant_path));
+		if (ret == 0)
+			ret = cfi_read_int_file(tolerant_path, &val);
+		if (ret == 0) {
+			orig_mce_tolerant = val;
+			if (val < (int)cfi_mce_tolerant) {
+				ret = cfi_write_int_file(tolerant_path,
+							 cfi_mce_tolerant);
+				if (ret == 0) {
+					pr_info("set MCE tolerant=%u via %s (was %d)\n",
+						cfi_mce_tolerant, tolerant_path, val);
+					tolerant_set = true;
+				} else {
+					pr_warn("failed to set MCE tolerant via sysfs: %d\n", ret);
+				}
 			} else {
-				pr_warn("failed to set MCE tolerant via sysfs: %d\n", ret);
+				tolerant_set = true;
 			}
 		} else {
-			tolerant_set = true;
+			pr_info("MCE tolerant sysfs not available (%d), "
+				"trying direct variable access\n", ret);
 		}
-	} else {
-		pr_info("MCE tolerant sysfs not available (%d), "
-			"trying direct variable access\n", ret);
 	}
 
 	if (!tolerant_set) {
@@ -318,7 +346,11 @@ void cfi_suppress_exit(void)
 	if (mce_tolerant_ptr) {
 		cfi_restore_tolerant_direct();
 	} else if (orig_mce_tolerant >= 0) {
-		cfi_write_int_file(SYSFS_MCE_TOLERANT, orig_mce_tolerant);
+		char tolerant_path[64];
+
+		if (cfi_mce_tolerant_path(tolerant_path,
+					  sizeof(tolerant_path)) == 0)
+			cfi_write_int_file(tolerant_path, orig_mce_tolerant);
 	}
 
 	if (orig_hardlockup_panic >= 0)

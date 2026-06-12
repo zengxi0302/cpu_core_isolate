@@ -40,6 +40,14 @@ static DEFINE_PER_CPU(atomic_t, cfi_hb_count);
 static DEFINE_PER_CPU(struct task_struct *, cfi_wd_thread);
 static DEFINE_PER_CPU(unsigned long, cfi_sched_ts);
 
+/* CPUs whose cfi_hb_timer has been hrtimer_init()'d + started. We can only
+ * safely hrtimer_cancel() those — calling hrtimer_active() (or _cancel())
+ * on a per-CPU slot that was never hrtimer_init()'d hits a NULL timer->base
+ * on 5.10 (observed on HCE 2.0 during the rmmod after a reload where one
+ * CPU was still isolated/offline when the second cfi_lockup_init() ran).
+ */
+static cpumask_var_t cfi_hb_init_mask;
+
 struct cfi_mon_cpu {
 	int last_hb;
 	int stale_cycles;
@@ -156,6 +164,7 @@ static void cfi_monitor_fn(struct work_struct *work)
 static void cfi_start_heartbeat_on_cpu(void *data)
 {
 	struct hrtimer *timer = this_cpu_ptr(&cfi_hb_timer);
+	int cpu = smp_processor_id();
 
 	atomic_set(this_cpu_ptr(&cfi_hb_count), 0);
 	__this_cpu_write(cfi_sched_ts, jiffies);
@@ -164,11 +173,28 @@ static void cfi_start_heartbeat_on_cpu(void *data)
 	timer->function = cfi_heartbeat_fn;
 	hrtimer_start(timer, ns_to_ktime(HEARTBEAT_INTERVAL_NS),
 		      HRTIMER_MODE_REL_PINNED);
+	cpumask_set_cpu(cpu, cfi_hb_init_mask);
 }
 
-static void cfi_stop_heartbeat_on_cpu(void *data)
+/*
+ * Cancel exactly the per-CPU heartbeat hrtimers we started in this module
+ * incarnation (tracked in cfi_hb_init_mask). Iterating for_each_possible_cpu
+ * is unsafe on 5.10: hrtimer_active() / hrtimer_cancel() dereference
+ * timer->base, which is NULL for a per-CPU slot that was never hrtimer_init'd
+ * (e.g. a CPU that was offline at init time). on_each_cpu is also unsafe in
+ * the other direction: a CPU that was online at init but isolated later had
+ * its hrtimer migrated by the hotplug code to a surviving CPU's timerqueue,
+ * and on_each_cpu won't visit that CPU. The init bitmap captures exactly
+ * the right set; hrtimer_cancel handles migrated timers correctly because
+ * the timer carries its current base pointer.
+ */
+static void cfi_cancel_all_heartbeats(void)
 {
-	hrtimer_cancel(this_cpu_ptr(&cfi_hb_timer));
+	unsigned int cpu;
+
+	for_each_cpu(cpu, cfi_hb_init_mask)
+		hrtimer_cancel(per_cpu_ptr(&cfi_hb_timer, cpu));
+	cpumask_clear(cfi_hb_init_mask);
 }
 
 int cfi_lockup_init(void)
@@ -180,9 +206,15 @@ int cfi_lockup_init(void)
 	if (!cfi_mon)
 		return -ENOMEM;
 
+	if (!zalloc_cpumask_var(&cfi_hb_init_mask, GFP_KERNEL)) {
+		kvfree(cfi_mon);
+		cfi_mon = NULL;
+		return -ENOMEM;
+	}
+
 	cfi_lockup_active = true;
 
-	/* Start heartbeat hrtimers on all online CPUs */
+	/* Start heartbeat hrtimers on all online CPUs (init_mask records them) */
 	on_each_cpu(cfi_start_heartbeat_on_cpu, NULL, 1);
 
 	/* Create per-CPU watchdog kthreads */
@@ -238,8 +270,9 @@ void cfi_lockup_exit(void)
 		}
 	}
 
-	/* Cancel hrtimers on all online CPUs */
-	on_each_cpu(cfi_stop_heartbeat_on_cpu, NULL, 1);
+	/* Cancel only the hrtimers we actually started (init_mask). */
+	cfi_cancel_all_heartbeats();
+	free_cpumask_var(cfi_hb_init_mask);
 
 	kvfree(cfi_mon);
 	cfi_mon = NULL;
