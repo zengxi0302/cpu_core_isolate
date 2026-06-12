@@ -28,8 +28,18 @@
 #include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/notifier.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
-#include <linux/panic_notifier.h>
+/*
+ * panic_notifier_list lives in <linux/panic_notifier.h> upstream from
+ * v5.17, but distros backport the header (e.g. Ubuntu 5.15). On kernels
+ * without it (HCE 2.0 / 5.10) the declaration comes via kernel.h. Probe
+ * for the header instead of version-gating so all three cases build.
+ */
+#if defined(__has_include)
+#  if __has_include(<linux/panic_notifier.h>)
+#    include <linux/panic_notifier.h>
+#  endif
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+#  include <linux/panic_notifier.h>
 #endif
 #include <linux/fs.h>
 #include <linux/uaccess.h>

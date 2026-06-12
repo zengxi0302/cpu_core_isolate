@@ -26,6 +26,34 @@
 `PageHuge` / `remove_cpu` / `add_cpu` 均为 EXPORT_SYMBOL_GPL；
 `pfn_to_online_page` 在 5.10 为头文件内联（无需导出），5.12+ 为导出函数。
 
+## 1.1 物理机 CPU 下线：cpu_subsys_offline 被打桩的绕过
+
+虚拟机上 `remove_cpu()` 正常下线；但在 C7 计算节点这类物理机上，宿主的
+健康守护代理（hostguard 之类）会把 `cpu_subsys_offline()` 打桩成直接返回
+`-EINVAL`（防止 CPU 被随意摘除），导致 `remove_cpu()` 拿到 -22、CPU 并未
+真正下线。
+
+调用链 `remove_cpu → device_offline → bus->offline=cpu_subsys_offline(桩)
+→ cpu_device_down → cpu_down`。`cfi_hotplug.c` 改为**三级递进下线**，每级
+绕过更深一层：
+
+| 级别 | 入口 | 导出状态 | 作用 |
+|------|------|---------|------|
+| 1 | `remove_cpu(cpu)` | 导出 | 正常路径，保持设备模型一致（VM / 未打桩主机） |
+| 2 | `cpu_device_down(dev)` | 未导出，kprobe 解析 | 绕过 `cpu_subsys_offline` 桩 |
+| 3 | `cpu_down(cpu, CPUHP_OFFLINE)` | 未导出（static），kprobe 解析 | 连 `cpu_device_down` 也被桩时的兜底 |
+
+判定逻辑：`remove_cpu` 返回非 0 **且** `cpu_online(cpu)` 仍为真才升级
+（若 CPU 实际已下线只是返回码异常，则不重复动作）。走 2/3 级后会手动
+`dev->offline = true` 并补发 `KOBJ_OFFLINE` uevent——否则跳过了
+`device_offline()` 的记账，后续 `add_cpu()/device_online()` 会误判 CPU 仍
+在线而拒绝拉回。re-online 路径（`add_cpu → cpu_device_up → cpu_up`）做了
+对称处理。
+
+开关：模块参数 `offline_bypass`（默认 Y）；置 N 则只用 `remove_cpu`，
+保留旧行为作为应急退路。加载时 dmesg 打印
+`offline bypass resolved: cpu_device_down=ok ...` 表明各级符号解析情况。
+
 ## 2. 本开发环境的编译验证矩阵
 
 | 内核 | 来源 | 结果 |

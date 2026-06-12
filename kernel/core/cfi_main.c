@@ -63,6 +63,13 @@ module_param_named(lockup_thresh, cfi_lockup_thresh_secs, uint, 0644);
 MODULE_PARM_DESC(lockup_thresh,
 	"Seconds without scheduler activity to declare softlockup (default: 30)");
 
+bool cfi_offline_bypass = true;
+module_param_named(offline_bypass, cfi_offline_bypass, bool, 0644);
+MODULE_PARM_DESC(offline_bypass,
+	"If remove_cpu() is blocked (e.g. cpu_subsys_offline stubbed by a host "
+	"health agent returning -EINVAL), fall back to cpu_device_down()/"
+	"cpu_down() resolved via kprobe (default: Y)");
+
 /* --- Memory fault domain (MFI) parameters --- */
 
 bool mfi_enable = true;

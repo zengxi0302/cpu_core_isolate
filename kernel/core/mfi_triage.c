@@ -32,8 +32,14 @@
 #include <linux/version.h>
 #include <linux/mm.h>
 #include <linux/page-flags.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
-#include <linux/panic.h>
+/* panic() moved to <linux/panic.h> in v5.18; older kernels get it from
+ * kernel.h. Prefer header probing so distro backports build too. */
+#if defined(__has_include)
+#  if __has_include(<linux/panic.h>)
+#    include <linux/panic.h>
+#  endif
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
+#  include <linux/panic.h>
 #endif
 #include "cfi_internal.h"
 #include "mfi_internal.h"

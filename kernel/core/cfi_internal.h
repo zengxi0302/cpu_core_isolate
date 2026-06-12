@@ -96,6 +96,7 @@ extern bool cfi_defer_to_daemon;
 extern unsigned int cfi_defer_timeout_ms;
 extern unsigned int cfi_mce_tolerant;
 extern unsigned int cfi_lockup_thresh_secs;
+extern bool cfi_offline_bypass;
 
 /*
  * Global per-CPU info array (allocated in cfi_main.c).

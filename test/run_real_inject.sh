@@ -97,6 +97,17 @@ else
 fi
 sleep 1
 
+# 下线 bypass 符号解析情况（物理机上 cpu_subsys_offline 被守护代理打桩时用得到）
+BYP=$(dmesg | grep -m1 "offline bypass resolved")
+if [[ -n "$BYP" ]]; then
+    log "  ${BYP#*cpu_fault_isolate: }"
+    echo "$BYP" | grep -q "cpu_device_down=ok" \
+        && ok "offline bypass available (cpu_device_down resolved)" \
+        || skip "cpu_device_down not resolved (stub-bypass unavailable on this kernel)"
+else
+    skip "offline bypass status not in dmesg (offline_bypass=N?)"
+fi
+
 # netlink 监听
 ./test/tools/cfimon > "$MONLOG" 2>&1 &
 MONPID=$!
@@ -221,6 +232,10 @@ CE_AFT=$(cat /sys/devices/system/cpu/cpu$TC/cfi/uce_count 2>/dev/null || echo 0)
 log "  after:  cpu$TC state=$ST_AFT online=$ON_AFT uce_count=$CE_AFT"
 if [[ "$ST_AFT" == isolated && "$ON_AFT" == 0 ]]; then
     ok "MCE-chain L2 cache UCE -> CPU isolated"
+    # 物理机上 remove_cpu 可能被 cpu_subsys_offline 桩挡住; 报告实际下线路径
+    M=$(dmesg | grep -m1 "cpu$TC: offlined via\|cpu$TC: isolated successfully")
+    [[ "$M" == *"bypass"* ]] && ok "  offline took the stub-bypass path: ${M#*cpu_fault_isolate: }" \
+                             || log "  offline path: ${M#*cpu_fault_isolate: }"
 elif [[ $CE_AFT -gt $CE_BEF ]]; then
     ok "L2 cache UCE accounted (uce_count delta=$((CE_AFT-CE_BEF)))"
     bad "uce_count moved but state=$ST_AFT online=$ON_AFT, isolation didn't fire"
