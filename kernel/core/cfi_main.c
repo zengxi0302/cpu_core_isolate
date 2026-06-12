@@ -15,6 +15,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
+#include <linux/mm.h>
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include "cfi_internal.h"

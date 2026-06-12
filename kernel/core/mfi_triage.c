@@ -29,9 +29,12 @@
 #define pr_fmt(fmt) "cpu_fault_isolate: " fmt
 
 #include <linux/kernel.h>
+#include <linux/version.h>
 #include <linux/mm.h>
 #include <linux/page-flags.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
 #include <linux/panic.h>
+#endif
 #include "cfi_internal.h"
 #include "mfi_internal.h"
 #include "mfi_policy.h"
@@ -39,7 +42,6 @@
 static enum mfi_page_class mfi_classify_page(unsigned long pfn)
 {
 	struct page *page;
-	struct folio *folio;
 
 	page = pfn_to_online_page(pfn);
 	if (!page)
@@ -51,10 +53,19 @@ static enum mfi_page_class mfi_classify_page(unsigned long pfn)
 	if (PageBuddy(page))
 		return MFI_PG_FREE;
 
-	folio = page_folio(page);
-	if (folio_test_lru(folio) || folio_test_anon(folio) ||
-	    folio_test_hugetlb(folio))
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
+	{
+		struct folio *folio = page_folio(page);
+
+		if (folio_test_lru(folio) || folio_test_anon(folio) ||
+		    folio_test_hugetlb(folio))
+			return MFI_PG_USER;
+	}
+#else
+	/* Pre-folio kernels (HCE 2.0 / 5.10): classic page flags */
+	if (PageLRU(page) || PageAnon(page) || PageHuge(page))
 		return MFI_PG_USER;
+#endif
 
 	/* Unrecognized usage: treat as kernel data (conservative) */
 	return MFI_PG_KERNEL;

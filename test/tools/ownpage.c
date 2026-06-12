@@ -25,8 +25,15 @@
 #define PAGEMAP_PFN_MASK	((1ULL << 55) - 1)
 #define PAGEMAP_PRESENT		(1ULL << 63)
 
-int main(void)
+/*
+ * --poison: after printing the PFN, madvise(MADV_HWPOISON) the page.
+ * This drives the kernel's real memory_failure() consumption path and
+ * the expected outcome is this process dying of SIGBUS — which the
+ * validation script treats as PASS.
+ */
+int main(int argc, char **argv)
 {
+	int do_poison = (argc > 1 && !strcmp(argv[1], "--poison"));
 	long page_size = sysconf(_SC_PAGESIZE);
 	unsigned char *p;
 	uint64_t entry;
@@ -62,6 +69,16 @@ int main(void)
 	printf("pfn=0x%llx\n",
 	       (unsigned long long)(entry & PAGEMAP_PFN_MASK));
 	fflush(stdout);
+
+	if (do_poison) {
+		if (madvise(p, page_size, MADV_HWPOISON)) {
+			perror("madvise(MADV_HWPOISON)");
+			return 1;
+		}
+		/* Consume the poisoned page: expect SIGBUS here */
+		fprintf(stderr, "consuming poisoned page...\n");
+		return (*(volatile unsigned char *)p == 0xa5) ? 2 : 3;
+	}
 
 	/* Stay alive so the page keeps its owner; SIGBUS = test worked */
 	pause();

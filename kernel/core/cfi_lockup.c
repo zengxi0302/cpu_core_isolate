@@ -27,6 +27,7 @@
 #include <linux/workqueue.h>
 #include <linux/cpu.h>
 #include <linux/slab.h>
+#include <linux/mm.h>
 #include <linux/percpu.h>
 #include "cfi_internal.h"
 
