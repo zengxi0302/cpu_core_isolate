@@ -43,6 +43,32 @@
 static enum cpuhp_state cfi_hp_state;
 
 /*
+ * Dedicated workqueue for the actual cpu_down work. It must NOT be
+ * system_wq: some vendor kernels (HCE 2.0) run _cpu_down via
+ * work_on_cpu(), which itself queues onto system_wq and flushes. If our
+ * offline work also sat on system_wq, the outer work would block a
+ * system_wq worker while waiting for the inner work_on_cpu item — and
+ * under a burst of isolations (e.g. our own lockup detector reacting to
+ * the stalls a teardown causes) system_wq saturates and deadlocks.
+ * An ordered (max_active=1) unbound wq also serializes offlines so two
+ * CPUs are never torn down concurrently, and never runs on a wedged CPU.
+ */
+static struct workqueue_struct *cfi_hotplug_wq;
+
+/* >0 while an offline is executing; read by the lockup detector. */
+static atomic_t cfi_offline_inflight = ATOMIC_INIT(0);
+
+bool cfi_offline_in_progress(void)
+{
+	return atomic_read(&cfi_offline_inflight) > 0;
+}
+
+bool cfi_cpu_is_protected(unsigned int cpu)
+{
+	return cfi_protect_cpu0 && cpu == 0;
+}
+
+/*
  * Lower-level hotplug entry points, resolved at init via kprobe because
  * they are not exported to modules. Any may be NULL if not found, in
  * which case that escalation level is skipped.
@@ -248,6 +274,18 @@ int cfi_hotplug_init(void)
 
 	cfi_hp_state = ret;
 
+	/*
+	 * Ordered (single in-flight), independent of system_wq. See the
+	 * comment on cfi_hotplug_wq above for why this matters on vendor
+	 * kernels that route _cpu_down through work_on_cpu().
+	 */
+	cfi_hotplug_wq = alloc_ordered_workqueue("cfi_hotplug", WQ_MEM_RECLAIM);
+	if (!cfi_hotplug_wq) {
+		cpuhp_remove_state(cfi_hp_state);
+		cfi_hp_state = 0;
+		return -ENOMEM;
+	}
+
 	/* Resolve the deeper offline entry points for the stub-bypass path */
 	cfi_resolve_offline_bypass();
 	return 0;
@@ -255,8 +293,18 @@ int cfi_hotplug_init(void)
 
 void cfi_hotplug_exit(void)
 {
+	if (cfi_hotplug_wq) {
+		destroy_workqueue(cfi_hotplug_wq);	/* drains pending offlines */
+		cfi_hotplug_wq = NULL;
+	}
 	if (cfi_hp_state)
 		cpuhp_remove_state(cfi_hp_state);
+}
+
+/* Queue the offline work on the dedicated wq (never system_wq). */
+static void cfi_queue_offline(struct cfi_cpu_info *ci)
+{
+	queue_work(cfi_hotplug_wq, &ci->offline_work);
 }
 
 /*
@@ -271,6 +319,16 @@ void cfi_offline_work_fn(struct work_struct *work)
 	unsigned long flags;
 	int ret;
 
+	/* Last-line guard: never tear down a protected CPU. */
+	if (cfi_cpu_is_protected(cpu)) {
+		spin_lock_irqsave(&ci->lock, flags);
+		ci->state = CFI_STATE_ONLINE;
+		spin_unlock_irqrestore(&ci->lock, flags);
+		pr_warn("cpu%u: protected, refusing to offline\n", cpu);
+		cfi_nl_send_state_change(cpu, CFI_STATE_ONLINE);
+		return;
+	}
+
 	pr_info("cpu%u: taking offline\n", cpu);
 
 	/*
@@ -280,8 +338,13 @@ void cfi_offline_work_fn(struct work_struct *work)
 	 * - Moves IRQs to other CPUs
 	 * - Stops per-CPU kernel threads
 	 * - Drains the CPU's run queue
+	 *
+	 * Mark an offline in flight so the lockup detector does not react to
+	 * the transient stalls a teardown causes by scheduling more offlines.
 	 */
+	atomic_inc(&cfi_offline_inflight);
 	ret = cfi_cpu_do_offline(cpu);
+	atomic_dec(&cfi_offline_inflight);
 
 	spin_lock_irqsave(&ci->lock, flags);
 	if (ret == 0) {
@@ -310,7 +373,7 @@ void cfi_defer_timer_fn(struct timer_list *t)
 	pr_warn("cpu%u: daemon ACK timeout (%u ms), forcing offline\n",
 		cpu, cfi_defer_timeout_ms);
 
-	schedule_work(&ci->offline_work);
+	cfi_queue_offline(ci);
 }
 
 /*
@@ -330,6 +393,31 @@ void cfi_defer_timer_fn(struct timer_list *t)
 void cfi_begin_isolation(unsigned int cpu, bool urgent)
 {
 	struct cfi_cpu_info *ci = &cfi_cpus[cpu];
+	unsigned long flags;
+
+	/*
+	 * Single chokepoint for the protected-CPU policy: covers every
+	 * caller (core state machine, lockup detector, netlink ISOLATE).
+	 * Revert the ISOLATING transition the caller just made.
+	 */
+	if (cfi_cpu_is_protected(cpu)) {
+		spin_lock_irqsave(&ci->lock, flags);
+		ci->state = CFI_STATE_ONLINE;
+		spin_unlock_irqrestore(&ci->lock, flags);
+		pr_warn_ratelimited("cpu%u: protected, isolation refused\n", cpu);
+		cfi_nl_send_state_change(cpu, CFI_STATE_ONLINE);
+		return;
+	}
+
+	/* Never isolate the last online CPU. */
+	if (cpumask_weight(cpu_online_mask) <= 1) {
+		spin_lock_irqsave(&ci->lock, flags);
+		ci->state = CFI_STATE_FAILED;
+		spin_unlock_irqrestore(&ci->lock, flags);
+		pr_err("cpu%u: last online CPU, cannot isolate\n", cpu);
+		cfi_nl_send_state_change(cpu, CFI_STATE_FAILED);
+		return;
+	}
 
 	ci->daemon_acked = false;
 
@@ -339,30 +427,16 @@ void cfi_begin_isolation(unsigned int cpu, bool urgent)
 		mod_timer(&ci->defer_timer,
 			  jiffies + msecs_to_jiffies(cfi_defer_timeout_ms));
 	} else {
-		unsigned int target;
-
 		if (urgent)
 			pr_info("cpu%u: urgent isolation, skipping daemon deferral\n",
 				cpu);
-
 		/*
-		 * For urgent isolation (lockup, fatal MCE), ensure the
-		 * offline work runs on a healthy CPU. The faulting CPU may
-		 * not be processing its workqueue (hardlockup) or may have
-		 * corrupted context (MCE PCC).
+		 * The ordered unbound cfi_hotplug_wq runs the teardown on a
+		 * healthy CPU (never the faulting one — an unbound pool will
+		 * not pick a wedged CPU) and serializes offlines, so there is
+		 * no need to hand-pick a target as before.
 		 */
-		target = raw_smp_processor_id();
-		if (urgent && target == cpu) {
-			target = cpumask_any_but(cpu_online_mask, cpu);
-			if (target >= nr_cpu_ids) {
-				pr_err("cpu%u: last online CPU, cannot self-isolate\n",
-				       cpu);
-				return;
-			}
-			queue_work_on(target, system_wq, &ci->offline_work);
-		} else {
-			schedule_work(&ci->offline_work);
-		}
+		cfi_queue_offline(ci);
 	}
 }
 
@@ -395,7 +469,7 @@ void cfi_daemon_ack_isolate(unsigned int cpu)
 	del_timer_sync(&ci->defer_timer);
 
 	pr_info("cpu%u: daemon ACK received, proceeding with offline\n", cpu);
-	schedule_work(&ci->offline_work);
+	cfi_queue_offline(ci);
 }
 
 /*

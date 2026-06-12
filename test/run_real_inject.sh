@@ -120,6 +120,13 @@ dmesg -c >/dev/null 2>&1
 # 用法: mce_inject <flags> <bank> <status_hex> <addr_hex> <misc_hex> <cpu>
 mce_inject() {
     local flags=$1 bank=$2 status=$3 addr=$4 misc=$5 cpu=$6
+    # 护栏: 绝不向离线 CPU 注入。inj_*_set 会用 smp_call_function_single
+    # 打目标 CPU; 若该 CPU 正在/已经下线, 调用方会硬卡死 (本机实测教训)。
+    local onf="/sys/devices/system/cpu/cpu$cpu/online"
+    if [[ -f "$onf" && "$(cat "$onf")" == "0" ]]; then
+        log "  [GUARD] cpu$cpu is offline, skipping mce_inject"
+        return 1
+    fi
     echo "$status"  > "$INJ_DIR/status"
     echo "$addr"    > "$INJ_DIR/addr"
     echo "$misc"    > "$INJ_DIR/misc"
@@ -154,6 +161,27 @@ STAT_MEM_SRAR=0xbd80000000000094
 STAT_CACHE_UCE_L2=0xb00000000000000e
 STAT_CACHE_CE_L2=0x900000000000000e
 STAT_CACHE_UCE_L3=0xb00000000000000f
+
+# 安全的隔离目标 CPU: 不用 cpu0 (受保护/housekeeping), 不用最后一个,
+# 取中段一个。物理机上 cpu0 常是厂商 work_on_cpu 跑 teardown 的宿主。
+NCPU=$(nproc)
+SAFE_TGT=$(( NCPU / 2 ))
+[[ $SAFE_TGT -le 0 ]] && SAFE_TGT=1
+
+# 稳健重新上线: 先试原生 sysfs; 物理机上 cpu_subsys_online 也可能被打桩,
+# 那时只能靠模块 unisolate 的 bypass (此处尽力而为, 失败仅告警不致命)。
+reonline_cpu() {
+    local cpu=$1 onf="/sys/devices/system/cpu/cpu$cpu/online"
+    [[ -f "$onf" ]] || return 0
+    [[ "$(cat "$onf")" == "1" ]] && return 0
+    echo 1 > "$onf" 2>/dev/null
+    sleep 1
+    if [[ "$(cat "$onf")" == "1" ]]; then
+        log "  cpu$cpu re-onlined"
+    else
+        log "  [WARN] cpu$cpu 仍离线 (online 侧可能也被打桩); 后续不再向其注入"
+    fi
+}
 
 # ---------- A1 Memory CE via real MCE decode chain ----------
 hdr "A1 Memory CE (sw inject -> x86_mce_decoder_chain -> mfi CE accounting)"
@@ -219,7 +247,7 @@ kill $A3 2>/dev/null
 
 # ---------- A4 Cache UCE via MCE chain (L2, simple errcode 0x000E) ----------
 hdr "A4 L2 Cache UCE on target CPU -> isolation"
-TC=$(($(nproc) - 1))
+TC=$SAFE_TGT
 CE_BEF=$(cat /sys/devices/system/cpu/cpu$TC/cfi/uce_count 2>/dev/null || echo 0)
 ST_BEF=$(cat /sys/devices/system/cpu/cpu$TC/cfi/state)
 log "  before: cpu$TC state=$ST_BEF uce_count=$CE_BEF"
@@ -242,13 +270,19 @@ elif [[ $CE_AFT -gt $CE_BEF ]]; then
 else
     bad "L2 cache UCE not visible (uce_count=0, dmesg may show details)"
 fi
-echo 1 > /sys/devices/system/cpu/cpu$TC/online 2>/dev/null || true
+# A4 把 SAFE_TGT 隔离了; 重新上线, 之后的子测试一律关 auto 只记账,
+# 避免在同一轮里反复下线/上线 (上线侧在物理机也可能被打桩)。
+reonline_cpu $TC
 sleep 1
 
+# 以下 A4b-A7 仅验证「真 MCE decode chain -> 各类错误分类记账」,
+# 关闭 auto_isolate, 不再触发 CPU 下线 (隔离能力已由 A4 单独验证)。
+echo 0 > /sys/kernel/cfi/auto_isolate 2>/dev/null
+log "  (A4b-A7: auto_isolate=0, accounting-only)"
+
 # ---------- A4b L3/generic Cache UCE (simple errcode 0x000F) ----------
-hdr "A4b L3 Cache UCE -> isolation"
-TC_B=$TC
-echo 0 > /sys/kernel/cfi/auto_isolate 2>/dev/null  # 先关 auto，只看记账
+hdr "A4b L3 Cache UCE accounting"
+TC_B=$SAFE_TGT
 CE_B0=$(cat /sys/devices/system/cpu/cpu$TC_B/cfi/uce_count 2>/dev/null || echo 0)
 mce_inject sw 3 "$STAT_CACHE_UCE_L3" 0 0 "$TC_B"
 sleep 2
@@ -257,11 +291,10 @@ ON_B=$(cat /sys/devices/system/cpu/cpu$TC_B/online)
 [[ $CE_B1 -gt $CE_B0 ]] && ok "L3 cache UCE accounted (delta=$((CE_B1-CE_B0)))" \
                        || bad "L3 cache UCE not accounted"
 [[ $ON_B == 1 ]] && ok "auto_isolate=0 -> stays online" || bad "isolated despite auto=0"
-echo 1 > /sys/kernel/cfi/auto_isolate
 
 # ---------- A5 Cache CE 计数 (L2 simple errcode 0x000E) ----------
 hdr "A5 L2 Cache CE累加 (expect no isolation)"
-TC2=$(($(nproc) - 2))
+TC2=$SAFE_TGT
 CE2_BEF=$(cat /sys/devices/system/cpu/cpu$TC2/cfi/ce_count 2>/dev/null || echo 0)
 for i in 1 2; do
     mce_inject sw 3 "$STAT_CACHE_CE_L2" 0 0 "$TC2"
@@ -275,12 +308,11 @@ log "  cpu$TC2 ce_count: $CE2_BEF -> $CE2_AFT"
                                                        || bad "CE caused isolation!"
 
 # ---------- A6 TLB error (compound errcode, bit 4 set) ----------
-hdr "A6 TLB error (compound errcode 0x0014, expect CFI_ERR_TLB)"
-TC3=$(($(nproc) - 3))
-[[ $TC3 -lt 0 ]] && TC3=0
+# auto_isolate 仍为 0 (A4 之后设置), 仅验证分类记账, 不触发下线。
+hdr "A6 TLB error (compound errcode 0x0816, expect CFI_ERR_TLB)"
+TC3=$SAFE_TGT
 CE3_BEF=$(cat /sys/devices/system/cpu/cpu$TC3/cfi/uce_count 2>/dev/null || echo 0)
 # compound bit (0x0800) set + 0x0010 (TLB) + LL=L2: errcode = 0x0816
-# severity: UC for visibility
 mce_inject sw 2 0xb000000000000816 0 0 "$TC3"
 sleep 2
 CE3_AFT=$(cat /sys/devices/system/cpu/cpu$TC3/cfi/uce_count 2>/dev/null || echo 0)
@@ -289,11 +321,10 @@ if [[ $CE3_AFT -gt $CE3_BEF ]]; then
 else
     skip "TLB UCE not visible in uce_count (may be accounted under different type)"
 fi
-echo 1 > /sys/devices/system/cpu/cpu$TC3/online 2>/dev/null || true
 
 # ---------- A7 Bus / interconnect error ----------
 hdr "A7 Bus error (compound errcode 0x0E0F with bit 11 set)"
-TC4=0
+TC4=$SAFE_TGT
 CE4_BEF=$(cat /sys/devices/system/cpu/cpu$TC4/cfi/uce_count 2>/dev/null || echo 0)
 # errcode 0x0E0F: bits 15..11=00001 (compound), 0x0800 set -> bus
 mce_inject sw 5 0xb000000000000e0f 0 0 "$TC4"
@@ -304,7 +335,7 @@ if [[ $CE4_AFT -gt $CE4_BEF ]]; then
 else
     skip "Bus UCE not visible (path-specific; not all bus errors per-CPU)"
 fi
-echo 1 > /sys/devices/system/cpu/cpu$TC4/online 2>/dev/null || true
+echo 1 > /sys/kernel/cfi/auto_isolate 2>/dev/null  # 恢复 auto_isolate
 
 # ---------- B hwpoison_inject 路径 ----------
 hdr "B hwpoison_inject (kernel-direct memory_failure full path)"
@@ -439,8 +470,10 @@ if [[ ${HW_AVAILABLE:-0} == 1 ]]; then
     kill $C3 2>/dev/null
 
     # ---- C4 hw L2 Cache UCE: 真 #MC -> cpu 域隔离 ----
-    log "  --- C4 hw L2 cache UCE on cpu$(($(nproc)-1)) (expect isolation) ---"
-    TCH=$(($(nproc)-1))
+    echo 1 > /sys/kernel/cfi/auto_isolate 2>/dev/null  # C4 需要真隔离
+    TCH=$SAFE_TGT
+    reonline_cpu $TCH
+    log "  --- C4 hw L2 cache UCE on cpu$TCH (expect isolation) ---"
     UC_C0=$(cat /sys/devices/system/cpu/cpu$TCH/cfi/uce_count 2>/dev/null || echo 0)
     ST_C0=$(cat /sys/devices/system/cpu/cpu$TCH/cfi/state)
     log "    before: cpu$TCH state=$ST_C0 uce=$UC_C0"
@@ -457,13 +490,13 @@ if [[ ${HW_AVAILABLE:-0} == 1 ]]; then
     else
         bad "hw cache UCE not visible in CFI (decode chain not reached?)"
     fi
-    echo 1 > /sys/devices/system/cpu/cpu$TCH/online 2>/dev/null || true
+    reonline_cpu $TCH
+    echo 0 > /sys/kernel/cfi/auto_isolate 2>/dev/null  # C5 仅记账
     sleep 1
 
     # ---- C5 hw L2 Cache CE: 真 #MC corrected handler ----
     log "  --- C5 hw L2 cache CE (corrected handler path) ---"
-    TCC=$(($(nproc)-2))
-    [[ $TCC -lt 0 ]] && TCC=0
+    TCC=$SAFE_TGT
     CC_C0=$(cat /sys/devices/system/cpu/cpu$TCC/cfi/ce_count 2>/dev/null || echo 0)
     mce_inject hw 3 "$STAT_CACHE_CE_L2" 0 0 "$TCC"
     sleep 2
@@ -484,11 +517,10 @@ dmesg | grep -E "MCE.*Hardware Error|memory_failure|Memory failure|cpu_fault_iso
 # ---------- 清理 ----------
 hdr "Cleanup"
 kill $MONPID 2>/dev/null
-# re-online 任何 offline CPU
+echo 1 > /sys/kernel/cfi/auto_isolate 2>/dev/null
+# re-online 任何 offline CPU (稳健路径)
 for c in $(seq 0 $(($(nproc)-1))); do
-    if [[ -e /sys/devices/system/cpu/cpu$c/online ]]; then
-        [[ $(cat /sys/devices/system/cpu/cpu$c/online) == 0 ]] && echo 1 > /sys/devices/system/cpu/cpu$c/online
-    fi
+    reonline_cpu $c
 done
 sleep 1
 rmmod cpu_fault_isolate 2>&1 | tee -a "$REPORT" && ok "cfi module unloaded cleanly" || bad "rmmod failed"

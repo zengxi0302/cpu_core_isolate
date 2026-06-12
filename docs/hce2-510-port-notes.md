@@ -54,6 +54,36 @@
 保留旧行为作为应急退路。加载时 dmesg 打印
 `offline bypass resolved: cpu_device_down=ok ...` 表明各级符号解析情况。
 
+## 1.2 物理机首次注入「系统卡死」根因与修复
+
+bypass 让 cpu71 真的下线了（dmesg `smpboot: CPU 71 is now offline`），
+但整机随后冻死、远程 panic。逐行还原日志后定位到三个**叠加**根因，全部
+在本模块侧，已修复：
+
+1. **offline work 跑在 system_wq 上**。HCE2 内核把 `cpu_down_maps_locked`
+   改成用 `work_on_cpu()` 在 housekeeping CPU 上跑 `_cpu_down`（堆栈
+   `work_for_cpu_fn → _cpu_down`），而 `work_on_cpu` 也排到 system_wq 并
+   flush。外层（我们的 offline work）占着 system_wq worker 等内层、内层
+   又抢 system_wq worker → 叠加洪泛后死锁。
+   **修复**：改用独立的有序工作队列 `alloc_ordered_workqueue("cfi_hotplug")`
+   （`WQ_MEM_RECLAIM`），与 system_wq 隔离，且 `max_active=1` 串行化下线，
+   unbound 池不会调度到已卡死的 CPU。
+2. **lockup 检测器雪崩**。下线过程本身会瞬时拖停其他 CPU（stop-machine /
+   IRQ 迁移 / `work_on_cpu` teardown），心跳变陈旧，我们的检测器误判为
+   lockup 又去隔离 cpu0/cpu5，往死锁上加码。
+   **修复**：新增 `cfi_offline_in_progress()`（in-flight 原子计数）；下线
+   执行期间 lockup 检测器整轮暂停、`cfi_report_error` 的 lockup 分支也直接
+   跳过，不标记 `lockup_reported`（避免永久屏蔽后续真实检测）。
+3. **cpu0 被卷入隔离**。cpu0 是 boot CPU，且在 HCE2 上正是 `work_on_cpu`
+   跑 teardown 的宿主，隔离它 = 自掘坟墓。
+   **修复**：新增 `protect_cpu0`（默认 Y），`cfi_begin_isolation` 单一
+   chokepoint 拒绝隔离受保护 CPU 与最后一个在线 CPU。
+
+测试脚本侧（非内核 bug，但会加剧）：`mce_inject` 增加「目标 CPU 离线则
+跳过」护栏（`smp_call_function_single` 打正在下线的 CPU 会硬卡死）；隔离
+测试改用中段安全 CPU（非 cpu0、非末位），A4b–A7 关 `auto_isolate` 只验
+分类记账，隔离能力由 A4 单独验证；重新上线走稳健重试函数。
+
 ## 2. 本开发环境的编译验证矩阵
 
 | 内核 | 来源 | 结果 |

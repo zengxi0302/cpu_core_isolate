@@ -97,6 +97,7 @@ extern unsigned int cfi_defer_timeout_ms;
 extern unsigned int cfi_mce_tolerant;
 extern unsigned int cfi_lockup_thresh_secs;
 extern bool cfi_offline_bypass;
+extern bool cfi_protect_cpu0;
 
 /*
  * Global per-CPU info array (allocated in cfi_main.c).
@@ -120,6 +121,10 @@ void cfi_begin_isolation(unsigned int cpu, bool urgent);
 int  cfi_unisolate_cpu(unsigned int cpu);
 void cfi_offline_work_fn(struct work_struct *work);
 void cfi_defer_timer_fn(struct timer_list *t);
+/* True while a CPU offline is executing; lockup isolation must not pile on */
+bool cfi_offline_in_progress(void);
+/* True if this CPU must never be auto-isolated (e.g. CPU0 when protected) */
+bool cfi_cpu_is_protected(unsigned int cpu);
 
 /* --- cfi_netlink.c --- */
 int  cfi_netlink_init(void);

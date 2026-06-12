@@ -70,6 +70,13 @@ MODULE_PARM_DESC(offline_bypass,
 	"health agent returning -EINVAL), fall back to cpu_device_down()/"
 	"cpu_down() resolved via kprobe (default: Y)");
 
+bool cfi_protect_cpu0 = true;
+module_param_named(protect_cpu0, cfi_protect_cpu0, bool, 0644);
+MODULE_PARM_DESC(protect_cpu0,
+	"Never auto-isolate CPU0: it is the boot CPU and, on some vendor "
+	"kernels, the housekeeping CPU that runs the hotplug teardown "
+	"(work_on_cpu); offlining it mid-teardown deadlocks (default: Y)");
+
 /* --- Memory fault domain (MFI) parameters --- */
 
 bool mfi_enable = true;

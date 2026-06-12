@@ -92,8 +92,9 @@ static enum hrtimer_restart cfi_heartbeat_fn(struct hrtimer *timer)
 	    time_after(jiffies, sched_ts + cfi_lockup_thresh_secs * HZ)) {
 		struct cfi_cpu_info *ci = &cfi_cpus[cpu];
 
-		if (ci->state == CFI_STATE_ONLINE ||
-		    ci->state == CFI_STATE_DEGRADED) {
+		if ((ci->state == CFI_STATE_ONLINE ||
+		     ci->state == CFI_STATE_DEGRADED) &&
+		    !cfi_cpu_is_protected(cpu) && !cfi_offline_in_progress()) {
 			cfi_report_lockup(cpu, CFI_ERR_SOFTLOCKUP);
 			/*
 			 * Clear timestamp to avoid re-reporting every
@@ -131,15 +132,25 @@ static void cfi_monitor_fn(struct work_struct *work)
 	if (!cfi_lockup_active)
 		return;
 
+	/*
+	 * While a CPU offline is executing, heartbeats stall across the
+	 * machine for reasons that are not lockups (stop-machine, IRQ
+	 * migration, vendor work_on_cpu teardown). Pause detection for this
+	 * cycle rather than misread it and pile on more isolations.
+	 */
+	if (cfi_offline_in_progress())
+		goto rearm;
+
 	for_each_online_cpu(cpu) {
 		struct cfi_mon_cpu *mc = &cfi_mon[cpu];
 		struct cfi_cpu_info *ci = &cfi_cpus[cpu];
 		int cur;
 
-		/* Skip CPUs already handled */
+		/* Skip CPUs already handled or that we will never isolate */
 		if (ci->state == CFI_STATE_ISOLATING ||
 		    ci->state == CFI_STATE_ISOLATED ||
-		    mc->lockup_reported)
+		    mc->lockup_reported ||
+		    cfi_cpu_is_protected(cpu))
 			continue;
 
 		cur = atomic_read(per_cpu_ptr(&cfi_hb_count, cpu));
@@ -155,6 +166,8 @@ static void cfi_monitor_fn(struct work_struct *work)
 			mc->last_hb = cur;
 		}
 	}
+
+rearm:
 
 	if (cfi_lockup_active)
 		schedule_delayed_work(&cfi_monitor_dwork,
