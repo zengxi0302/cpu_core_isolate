@@ -274,3 +274,33 @@ cpu_fault_isolate: registered on HCE3 fma_mce_do_chain
   坏 DIMM 的 CE 风暴会把健康核推进 DEGRADED/隔离（实测发现并修复）
 - **解法**：MCACOD 内存签名判定提为共享内联（`cfi_x86.h::cfi_x86_is_memory_errcode`），
   CPU 域显式忽略内存错误；CEC 探测自动降级预隔离；DIMM 记账只上报不动整机
+
+## T12: 为「海量页」记账，而不是为「百个核」（难度 ★★★）
+
+- **难点**：CPU 域状态对象只有 nr_cpu_ids 个；内存域是数亿物理页，且事件来自
+  原子上下文（不能睡眠/大分配），页处置本身又必须能睡眠
+- **常规失效**：外挂全量页表内存失控；无界哈希被坏 DIMM 风暴打爆；
+  事件上下文直接做页迁移 → 原子上下文睡眠死机
+- **解法**：固定容量哈希（1024 项，最坏 ~64KB）+ LRU 淘汰；在途页
+  （PRE_ISO/POISONED）永不淘汰；OFFLINED 即出表，HWPoison 标志做持久事实源；
+  事件路径只查表计数，重操作下沉独立 workqueue（卸载 destroy 自动排空）
+- 代码：`core/mfi_core.c::mfi_page_get()`
+
+## T13: 四个事件源，一个事实——融合与归一化（难度 ★★★★）
+
+- **难点**：同一物理错误可能同时来自 MCE decode chain / EDAC mc_event /
+  GHES / FMA；地址语义不一、信息互补（label vs PFN）、EDAC 不区分是否已消费；
+  tracepoint 原型逐参数硬匹配，版本漂移时运行时静默错位
+- **解法**：归一到 mfi_mem_error{pfn,type,flags,label}；消费语义只信 MCE/SEA
+  的 AR 位，EDAC UCE 一律按异步处理交 HWPoison 判重兜底；无地址 mc_event 只做
+  介质记账；探针注册失败降级为"该源不可用"而非整体失败
+- 代码：`core/mfi_dimm.c::mfi_mc_event_probe()`
+
+## T14: 如何测试一条「判决可能是 panic」的路径（难度 ★★★）
+
+- **难点**：甄别引擎一半出口是 panic，错判决一次测试机就没了；真实 UCE 依赖
+  EINJ 物理机，迭代以天计；页隔离真杀进程，随机靶页会误伤环境
+- **解法**：四层金字塔——① 判决逻辑抽为零内核依赖纯函数（mfi_policy.h），
+  内核与单测同源同实现，18 用例扫全判决表；② debugfs 注入走真实处置路径；
+  ③ ownpage 自备靶页，误伤面=1 个牺牲进程；④ EINJ 只验硬件通路不验逻辑
+- 代码：`test/unit/test_mfi_policy.c`、`test/tools/ownpage.c`
