@@ -98,6 +98,7 @@ extern unsigned int cfi_mce_tolerant;
 extern unsigned int cfi_lockup_thresh_secs;
 extern bool cfi_offline_bypass;
 extern bool cfi_protect_cpu0;
+extern bool cfi_soft_isolation;
 
 /*
  * Global per-CPU info array (allocated in cfi_main.c).

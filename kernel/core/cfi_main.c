@@ -77,6 +77,16 @@ MODULE_PARM_DESC(protect_cpu0,
 	"kernels, the housekeeping CPU that runs the hotplug teardown "
 	"(work_on_cpu); offlining it mid-teardown deadlocks (default: Y)");
 
+bool cfi_soft_isolation = false;
+module_param_named(soft_isolation, cfi_soft_isolation, bool, 0644);
+MODULE_PARM_DESC(soft_isolation,
+	"Isolate by migrating IRQs off the faulty CPU + reporting, instead "
+	"of CPU hotplug offline. REQUIRED on vendor kernels where full "
+	"cpu_down() deadlocks (e.g. HCE2: work_on_cpu-wrapped _cpu_down + "
+	"cgroup-v1 cpuset hotplug vs cpus_rwsem). The CPU stays online; the "
+	"daemon migrates vCPUs/tasks off it. Never touches cpus_rwsem, so it "
+	"cannot deadlock the hotplug path (default: N)");
+
 /* --- Memory fault domain (MFI) parameters --- */
 
 bool mfi_enable = true;

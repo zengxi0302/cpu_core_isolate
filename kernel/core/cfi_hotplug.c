@@ -37,6 +37,9 @@
 #include <linux/timer.h>
 #include <linux/device.h>
 #include <linux/kprobes.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irqnr.h>
 #include "cfi_internal.h"
 
 /* CPU hotplug state handle, used for cleanup on module exit */
@@ -277,9 +280,12 @@ int cfi_hotplug_init(void)
 	/*
 	 * Ordered (single in-flight), independent of system_wq. See the
 	 * comment on cfi_hotplug_wq above for why this matters on vendor
-	 * kernels that route _cpu_down through work_on_cpu().
+	 * kernels that route _cpu_down through work_on_cpu(). Note: NOT
+	 * WQ_MEM_RECLAIM — cpu_device_down() flushes the non-reclaim
+	 * system_wq internally (work_on_cpu), and a reclaim wq flushing a
+	 * non-reclaim one trips check_flush_dependency().
 	 */
-	cfi_hotplug_wq = alloc_ordered_workqueue("cfi_hotplug", WQ_MEM_RECLAIM);
+	cfi_hotplug_wq = alloc_ordered_workqueue("cfi_hotplug", 0);
 	if (!cfi_hotplug_wq) {
 		cpuhp_remove_state(cfi_hp_state);
 		cfi_hp_state = 0;
@@ -288,6 +294,11 @@ int cfi_hotplug_init(void)
 
 	/* Resolve the deeper offline entry points for the stub-bypass path */
 	cfi_resolve_offline_bypass();
+
+	pr_info("isolation mode: %s\n",
+		cfi_soft_isolation ?
+		"SOFT (IRQ migration, CPU stays online — safe on vendor kernels)" :
+		"OFFLINE (cpu hotplug down — VM / non-stubbed hosts only)");
 	return 0;
 }
 
@@ -308,8 +319,58 @@ static void cfi_queue_offline(struct cfi_cpu_info *ci)
 }
 
 /*
- * Workqueue function: actually take the CPU offline.
- * Runs in process context (kworker).
+ * Soft isolation: steer every movable IRQ off the faulty CPU and leave
+ * it in cpu_online_mask. This never touches cpus_rwsem / the CPU hotplug
+ * state machine, so it cannot hit the cpu_down() deadlock seen on vendor
+ * kernels (HCE2: work_on_cpu-wrapped _cpu_down racing cgroup-v1 cpuset
+ * hotplug for cpus_read_lock). Task/vCPU migration is the daemon's job
+ * (it knows which qemu threads are pinned where); the kernel side just
+ * removes interrupt load and reports. Best-effort: managed/per-CPU IRQs
+ * that cannot be moved are skipped.
+ */
+static int cfi_soft_isolate_cpu(unsigned int cpu)
+{
+	cpumask_var_t mask;
+	unsigned int irq, moved = 0;
+
+	if (!zalloc_cpumask_var(&mask, GFP_KERNEL))
+		return -ENOMEM;
+
+	for (irq = 0; irq < nr_irqs; irq++) {
+		struct irq_data *d = irq_get_irq_data(irq);
+		const struct cpumask *aff;
+
+		if (!d)
+			continue;
+		aff = irq_data_get_affinity_mask(d);
+		if (!aff || !cpumask_test_cpu(cpu, aff))
+			continue;
+
+		/* Preserve the IRQ's policy, just drop the faulty CPU. */
+		cpumask_and(mask, aff, cpu_online_mask);
+		cpumask_clear_cpu(cpu, mask);
+		if (cpumask_empty(mask)) {
+			/* Affinity was only the faulty CPU: spread to all others */
+			cpumask_copy(mask, cpu_online_mask);
+			cpumask_clear_cpu(cpu, mask);
+		}
+		if (cpumask_empty(mask))
+			continue;	/* would be the last CPU; leave it */
+
+		if (irq_set_affinity(irq, mask) == 0)
+			moved++;
+	}
+
+	free_cpumask_var(mask);
+	pr_info("cpu%u: soft-isolated (migrated %u IRQs; CPU stays online, daemon migrates tasks/vCPUs)\n",
+		cpu, moved);
+	return 0;
+}
+
+/*
+ * Workqueue function: isolate the CPU. Runs in process context (kworker).
+ * Two modes: full hotplug offline (default; VM and non-stubbed hosts) or
+ * soft isolation (IRQ migration; required where cpu_down() deadlocks).
  */
 void cfi_offline_work_fn(struct work_struct *work)
 {
@@ -324,8 +385,25 @@ void cfi_offline_work_fn(struct work_struct *work)
 		spin_lock_irqsave(&ci->lock, flags);
 		ci->state = CFI_STATE_ONLINE;
 		spin_unlock_irqrestore(&ci->lock, flags);
-		pr_warn("cpu%u: protected, refusing to offline\n", cpu);
+		pr_warn("cpu%u: protected, refusing to isolate\n", cpu);
 		cfi_nl_send_state_change(cpu, CFI_STATE_ONLINE);
+		return;
+	}
+
+	if (cfi_soft_isolation) {
+		pr_info("cpu%u: soft-isolating (IRQ migration)\n", cpu);
+		ret = cfi_soft_isolate_cpu(cpu);
+
+		spin_lock_irqsave(&ci->lock, flags);
+		if (ret == 0) {
+			ci->state = CFI_STATE_ISOLATED;
+			ci->isolation_count++;
+		} else {
+			ci->state = CFI_STATE_FAILED;
+			pr_err("cpu%u: soft isolation failed: %d\n", cpu, ret);
+		}
+		spin_unlock_irqrestore(&ci->lock, flags);
+		cfi_nl_send_state_change(cpu, ci->state);
 		return;
 	}
 
@@ -500,11 +578,20 @@ int cfi_unisolate_cpu(unsigned int cpu)
 
 	spin_unlock_irqrestore(&ci->lock, flags);
 
-	pr_info("cpu%u: bringing back online\n", cpu);
-	ret = cfi_cpu_do_online(cpu);
-	if (ret) {
-		pr_err("cpu%u: failed to bring online: %d\n", cpu, ret);
-		return ret;
+	/*
+	 * Soft-isolated CPUs were never offlined — they only had their IRQs
+	 * steered away (which the kernel/irqbalance rebalances over time).
+	 * Nothing to hotplug back; just clear our bookkeeping.
+	 */
+	if (cfi_soft_isolation) {
+		pr_info("cpu%u: clearing soft isolation\n", cpu);
+	} else {
+		pr_info("cpu%u: bringing back online\n", cpu);
+		ret = cfi_cpu_do_online(cpu);
+		if (ret) {
+			pr_err("cpu%u: failed to bring online: %d\n", cpu, ret);
+			return ret;
+		}
 	}
 
 	spin_lock_irqsave(&ci->lock, flags);

@@ -84,6 +84,51 @@ bypass 让 cpu71 真的下线了（dmesg `smpboot: CPU 71 is now offline`），
 测试改用中段安全 CPU（非 cpu0、非末位），A4b–A7 关 `auto_isolate` 只验
 分类记账，隔离能力由 A4 单独验证；重新上线走稳健重试函数。
 
+## 1.3 完整下线在 HCE2 上仍死锁 → 软隔离（最终方案）
+
+加固后第二次实测：`cpu36` 真的下线了（`smpboot: CPU 36 is now offline`），
+但 `cfi_offline_work_fn` 的 kworker 仍 D 住、整机再次雪崩。剖析两个 D 进程：
+
+- pid7 `kworker/u144:0+cfi_hotplug`：**持有 `cpus_write_lock`**，卡在
+  `cpu_device_down → cpu_down_maps_locked → work_on_cpu → __flush_work`
+  （HCE2 把 `_cpu_down` 用 `work_on_cpu` 包到 system_wq 同步等待）。
+- pid554 `kworker/36:1+events`：绑在**正在下线的 cpu36** 上的 per-cpu
+  worker，跑 cgroup-v1 `cpuset_hotplug_workfn`，卡在 `cgroup_attach_lock →
+  cpus_read_lock`——被 pid7 的 write lock 挡死。
+
+死锁闭环：cpu36 下线要排空 cpu36 的 worker pool（含正在执行、卡在 read
+lock 的 pid554）→ pid554 等 read lock → read lock 被下线持有的 write lock
+挡 → 下线完不成。**这与我们用什么上下文调用无关**，是 HCE2 定制内核
+（`work_on_cpu` 包装 `_cpu_down` + legacy v1 cpuset 的 in-flight hotplug
+work 争 `cpus_rwsem`）的固有缺陷。厂商把 `cpu_subsys_offline` 打桩成
+-EINVAL，本意大概率就是**禁止整机做完整 hotplug offline**——硬绕过等于
+撞上他们要规避的死锁。另外那条
+`WQ_MEM_RECLAIM ... is flushing !WQ_MEM_RECLAIM` 警告证实 1.2 里给
+`cfi_hotplug` 加 `WQ_MEM_RECLAIM` 是错的（reclaim wq 不应 flush 非 reclaim
+wq），已去掉。
+
+**结论与最终方案**：完整 hotplug offline 在该机型不可用。新增**软隔离**
+模式（模块参数 `soft_isolation`，物理机置 1）：
+
+- `cfi_soft_isolate_cpu()` 遍历 `nr_irqs`，对 affinity 含故障核的中断用
+  `irq_get_irq_data()` + `irq_set_affinity()` 把它迁到其余在线核（保留原
+  policy，仅剔除故障核；managed/per-cpu 中断迁不动则跳过）。**全程不碰
+  `cpus_rwsem`/cpuset/hotplug 状态机，从机制上不可能死锁**。
+- CPU 保持 online，state 标记 ISOLATED；任务/vCPU 迁移交给 daemon（它知道
+  哪些 qemu 线程绑在该核），与项目「内核检测+上报、daemon 迁移」的总体
+  分工一致。
+- `soft_isolation` 默认 N（保持 VM 完整下线验证不变）；物理机/宿主机务必
+  置 1。加载时 dmesg 打印 `isolation mode: SOFT/OFFLINE`。
+
+| 模式 | 机制 | 适用 | 死锁风险 |
+|------|------|------|---------|
+| `soft_isolation=0`（默认） | hotplug offline（remove_cpu→bypass） | 裸 VM / 未定制内核 | HCE2 等定制内核上**会死锁** |
+| `soft_isolation=1` | 中断迁移 + 标记 + 上报，CPU 不下线 | 物理机 / 宿主机 | 无（不碰 cpus_rwsem） |
+
+`run_real_inject.sh` 默认以 `soft_isolation=1` 加载（物理机脚本），A4 据此
+校验「state=isolated 且 online 仍为 1 且 dmesg 有 soft-isolated 迁移 N 个
+中断」；传 `--offline` 可在确知安全的环境强制完整下线。
+
 ## 2. 本开发环境的编译验证矩阵
 
 | 内核 | 来源 | 结果 |
