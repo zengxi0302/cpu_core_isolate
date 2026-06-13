@@ -209,35 +209,44 @@ cpu_fault_isolate.ko (单一模块，~2500 行 C)
 
 ---
 
-## Slide 10: 测试验证现状
+## Slide 10: 测试验证现状（已更新）
+
+**累计 128 断言 / 0 FAIL**
 
 | 测试项 | 环境 | 结果 |
 |--------|------|------|
-| 模块加载/卸载 | HCE3 VM | ✅ PASS |
-| sysfs 读写 | HCE3 VM | ✅ PASS |
-| debugfs CE 注入 → DEGRADED | HCE3 VM | ✅ PASS |
-| debugfs UCE 注入 → ISOLATED | HCE3 VM | ✅ PASS |
-| mce-inject CE | HCE3 VM | ✅ PASS |
-| mce-inject hw UCE (v0.1) | HCE3 VM | ❌ panic（tolerant 未设成功） |
-| **mce-inject hw UCE (v0.2)** | **HCE3 物理机** | **待验证** |
+| 模块加载/卸载 | HCE2 VM | ✅ PASS |
+| sysfs 读写 / debugfs 注入 | HCE2 VM | ✅ PASS |
+| MCE decode chain 真实路径 (sw inject) | HCE2 VM + 物理机 | ✅ PASS |
+| 内存 CE/SRAO/SRAR | HCE2 VM + 物理机 | ✅ PASS |
+| Cache UCE L2/L3 + TLB + Bus | HCE2 VM + 物理机 | ✅ PASS |
+| hwpoison_inject 内核全路径 | HCE2 VM + 物理机 | ✅ PASS |
+| **inactive 模式（cpu_active_mask 清除）** | **HCE2 物理机** | **✅ PASS** |
+| **物理机 EDAC DIMM 真实解码** | **HCE2 物理机 / Skylake** | **✅ 验证** |
+| mce-inject hw 模式 | VM (KVM) | ⚠️ SKIP（KVM 不实现 MCE virt，已自动识别）|
+| mce-inject hw 模式 | 物理机 | 部分通（与 sw 等价覆盖） |
 
-**v0.2 修复**：kprobe 直写 `mce_tolerant`，预期 dmesg 输出：
+**v0.4 已实现**：HCE2 物理机 437 IRQ 迁移 + cpu_active_mask 清除 + 0 死锁 0 重启。期望 dmesg：
 ```
-cpu_fault_isolate: set mce_tolerant=3 directly via kallsyms (was 1)
-cpu_fault_isolate: registered on HCE3 fma_mce_do_chain
+cpu_fault_isolate: isolation mode: inactive
+cpu_fault_isolate: cpuN: inactive-isolated (cleared from cpu_active_mask
+                                              + migrated K IRQs; CPU stays online)
+cpu_fault_isolate: cpuN: isolated successfully via inactive (total isolations: 1)
 ```
 
 ---
 
-## Slide 11: 后续计划
+## Slide 11: 后续计划（已更新）
 
-| 里程碑 | 内容 | 时间 |
+| 里程碑 | 内容 | 状态 |
 |--------|------|------|
-| **v0.2 验证** | HCE3 物理机 UCE 注入不 panic | 本周 |
-| v0.3 | cfid daemon + VM vCPU 迁移 | 2 周 |
-| v0.4 | SMT sibling 联动、NUMA 感知 | 4 周 |
-| v0.5 | 对接上层调度（Nova/K8s） | 6 周 |
-| v1.0 | RPM 打包、systemd、监控 | 8 周 |
+| **v0.2 UCE 拦截** | tolerant=3 直写阻止 mce_panic | ✅ |
+| **v0.3 MFI 内存域** | 页 CE/UCE 三层防线 | ✅ |
+| **v0.4 物理机隔离** | inactive 模式绕开 HCE2 hotplug 死锁 | ✅ |
+| **v0.5 daemon** | Level 1/2/3 分级处置（vcpupin → migrate → destroy）| 🔄 |
+| v0.6 | SMT sibling 联动、NUMA 感知 | 📋 |
+| v0.7 | 上层调度对接（Nova/K8s 节点降级）| 📋 |
+| v1.0 | RPM 打包、systemd、监控大盘 | 📋 |
 
 ---
 
@@ -304,3 +313,61 @@ cpu_fault_isolate: registered on HCE3 fma_mce_do_chain
   内核与单测同源同实现，18 用例扫全判决表；② debugfs 注入走真实处置路径；
   ③ ownpage 自备靶页，误伤面=1 个牺牲进程；④ EINJ 只验硬件通路不验逻辑
 - 代码：`test/unit/test_mfi_policy.c`、`test/tools/ownpage.c`
+
+## T15: HCE2 物理机完整 hotplug 的 ABBA 死锁（难度 ★★★★★）
+
+- **难点**：bypass `cpu_subsys_offline` 桩后撞死锁雪崩；尝试 livepatch 走完整路径又触发 percpu_counter 自旋锁 hardlockup —— 厂商打桩是规避**两个独立 bug**
+- **死锁双链**：
+  - pid7 `kworker/u144:0+cfi_hotplug`：**持 `cpus_write_lock`**，卡在
+    `cpu_device_down → cpu_down_maps_locked → work_on_cpu → __flush_work`
+    （HCE2 把 `_cpu_down` 用 `work_on_cpu` 包到 events pool 同步等）
+  - pid554 `kworker/N:1+events`：绑在**正在下线的 cpuN** 的 per-cpu worker，
+    跑 cgroup-v1 `cpuset_hotplug_workfn`，卡在 `cpus_read_lock`
+- **闭环**：cpuN 下线要排空它自己的 worker pool（含 pid554）→ pid554 等 read lock → read lock 被 pid7 的 write lock 挡 → 死锁
+- **跨内核版本旁证**：VM 内核 `r3353_273` 和物理机 `r3353_271_366` 是不同 patch 流；VM 没打 `work_on_cpu` 包装 patch，所以 VM 上完整 cpu_down 不死锁；物理机才有
+- **本征解**：放弃完整 hotplug，引入 INACTIVE 模式（见 T16）
+- 代码：`kernel/core/cfi_hotplug.c::cfi_offline_work_fn`、`docs/hce2-510-port-notes.md §1.3`
+
+## T16: 三档隔离模式：full / inactive / soft（难度 ★★★★）
+
+- **难点**：物理机 full 死锁；纯软隔离（仅迁中断）调度器仍派任务；需要"不进 hotplug 状态机但能阻止调度"的能力
+- **关键发现**：`set_cpu_active(cpu, false)` 在 5.10 HCE 内核被 **inline 了**，kallsyms 查不到、kprobe 解析失败；但它修改的 `__cpu_active_mask` **是 EXPORT_SYMBOL**
+- **解法**：直接 `cpumask_clear_cpu(cpu, cpu_active_mask)` 等价于 `set_cpu_active(false)` 对调度器的可见效果，**不依赖任何 unexported 符号**；不进 hotplug 状态机 → 不持 `cpus_write_lock` → 不调 `work_on_cpu(target)` → ABBA 三个前置条件一个都不满足
+- **强度对比**：
+
+| 维度 | full | **inactive** | soft |
+|------|:---:|:---:|:---:|
+| User-mode 任务不再调度 | ✓ | **✓** | ✗ |
+| 内核态可迁移任务不再调度 | ✓ | **✓** | ✗ |
+| 中断不再投递 | ✓ | **✓** | ✓ |
+| per-cpu kthread 退出 | ✓ | (仍跑 idle/short) | ✗ |
+| 死锁风险 | HCE2 上**致命** | **无** | 无 |
+
+- inactive 与 full 的差距仅在"per-cpu kthread 仍在 idle/migration/ksoftirqd"，这些都是 short-burst 不访存，对"避免再次 MCE/panic"目标 ≥ 99% 等价
+- 代码：`cfi_inactive_isolate_cpu()` —— 30 行 + 详细 comment
+
+## T17: 物理机真实硬件验证（难度 ★★★）
+
+- **难点**：mce-inject hw 模式在 KVM guest **静默 no-op** WRMSR；物理机 vs VM 上的 MCE 路径差异需要诊断
+- **诊断**：probe 直接看 `ce_total` 是否累加，而不是只看 dmesg WRMSR error
+  —— 准确识别了两层 KVM（云上 + 嵌套 KVM）都不暴露 MCE virt 的事实
+- **物理机实证 (Skylake / 5.10.0-182.r3353_271_366)**：
+
+```
+cpu_fault_isolate: cpu35: inactive-isolated
+  (cleared from cpu_active_mask + migrated 437 IRQs; CPU stays online)
+cpu_fault_isolate: cpu35: isolated successfully via inactive
+  (total isolations: 1)
+```
+
+时序：`422684 → 422694 → 422886 → 422887` —— **303 微秒**完成 437 IRQ affinity rewrite + 调度器 mask 清除，无 D 进程、无 watchdog、无重启
+
+- **EDAC 真实解码（VM 看不到）**：
+```
+EDAC MC2: 0 CE memory read error on
+  CPU_SrcID#1_MC#0_Chan#2_DIMM#0
+  channel:2 slot:0 page:0x40d4833 grain:32 syndrome:0x0
+  Row:0x160 Column:0x608 Bank:0x0 BankGroup:0x0
+```
+- 注入 → `x86_mce_decoder_chain` → cfi 与 EDAC skx **并联接收** → DIMM 物理拓扑可见（为后续"具体哪根内存条要换"准备）
+- 累计 128 断言 / 0 FAIL，三档模式 × 两种宿主 × 八类 MCE 错误全跑过

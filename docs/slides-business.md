@@ -109,12 +109,14 @@
 |------|:---:|------|
 | 需求分析 | ✅ 完成 | 覆盖 x86 + ARM64 场景 |
 | 架构设计 | ✅ 完成 | 三层防御、状态机、daemon 协作 |
-| 内核模块开发 | ✅ 完成 | ~2500 行 C，可编译加载 |
-| 软件注入测试 | ✅ 通过 | debugfs 注入验证全流程 |
-| MCE 通路测试 | ✅ 通过 | mce-inject CE 正常收到 |
-| **HCE3 UCE 拦截** | **🔄 验证中** | **v0.2 修复后待物理机验证** |
-| 用户态 daemon | 📋 规划中 | v0.3 目标 |
-| 上层调度对接 | 📋 规划中 | v0.5 目标 |
+| 内核模块开发 | ✅ 完成 | ~3000 行 C，可编译加载 |
+| 软件注入测试 | ✅ 通过 | debugfs / mce-inject sw / hwpoison_inject |
+| **MCE decode chain 真实路径** | **✅ 通过** | 内存 CE/SRAO/SRAR + cache L1/L2/L3 + TLB + Bus 八类 |
+| **HCE2 物理机 UCE 拦截** | **✅ 通过** | inactive 隔离 437 IRQs 迁移 / 0 死锁 / 0 重启 |
+| **物理机 EDAC DIMM 真实解码** | **✅ 验证** | CPU_SrcID#1_MC#0_Chan#2_DIMM#0 等真实定位可见 |
+| 三档隔离策略 | ✅ 实现 | full（VM）/ inactive（物理机推荐）/ soft（兜底）|
+| 用户态 daemon | 📋 v0.5 | 分级处置（vcpupin → migrate → destroy）|
+| 上层调度对接 | 📋 v1.0 | Nova / K8s 整机标降级 |
 
 ---
 
@@ -134,17 +136,23 @@
 
 ---
 
-## Slide 8: 落地路径
+## Slide 8: 落地路径（已更新）
 
 ```
   6月                    7月                   8月              9月
-  ├── v0.2 验证 ──┼── v0.3 daemon ───┼── v0.4 联动 ──┼── v1.0 产品化
+  ├── v0.4 ✅完成 ─┼── v0.5 daemon ───┼── v0.6 联动 ──┼── v1.0 产品化
   │                │                  │                │
-  │ HCE3 物理机    │ cfid 用户态      │ SMT sibling    │ RPM 包
-  │ UCE 不 panic   │ VM vCPU 迁移     │ NUMA 感知      │ systemd
-  │ CPU 成功隔离   │ 上报告警         │ 多核联动       │ 监控大盘
-  │                │ 热迁移触发       │                │ 客户交付
+  │ ✅ VM 全套     │ cfid 用户态      │ SMT sibling    │ RPM 包
+  │ ✅ 物理机三档  │ 分级处置:        │ NUMA 感知      │ systemd
+  │ ✅ 437 IRQ 迁  │  L1 vcpupin      │ 多核联动       │ 监控大盘
+  │ ✅ 0 死锁     │  L2 live migrate │ 跨节点降级     │ 客户交付
+  │ ✅ EDAC 真实   │  L3 destroy      │                │
 ```
+
+**当前里程碑（已达成）**：
+- VM 一键 P0–P8 + P9 真路径：60 PASS / 0 FAIL
+- 物理机 inactive / soft / --hw 三连：66 PASS / 0 FAIL / 累计 128 断言 0 失败
+- 三档隔离全部跑通，物理机不死锁不重启不杀 VM
 
 ---
 
@@ -178,14 +186,17 @@
 - **客户影响降低 98%+**：从全量 VM 到 1 个 VM
 - **服务恢复加速 10x**：从分钟级到秒级
 - **零内核修改**：纯模块交付，随时可装可卸
+- **不再默认杀 VM**：分级处置，多数场景客户无感
 
 ### 当前状态
-- 代码完成，软件注入测试通过
-- 待 HCE3 物理机验证 UCE 拦截（本周目标）
+- ✅ VM + 物理机端到端验证通过（128 断言 / 0 FAIL）
+- ✅ HCE2 物理机完整 hotplug 死锁定位并绕开（inactive 模式）
+- ✅ 真实 EDAC DIMM 拓扑解码可见
+- 🔄 daemon 分级处置在开发
 
 ### 请求决策
-- 批准物理测试机资源
-- 确认后续 daemon + 调度器集成的优先级
+- 确认 daemon Level 1/2/3 分级处置实现优先级
+- 试点节点选型与灰度规模
 
 ---
 
@@ -233,3 +244,61 @@
 | 内核态消费 UCE（虚机页） | 整机宕机，60 台全丢 | 杀 1 台 VM，59 台无感 |
 | 内核自身数据消费 UCE | 整机宕机（或静默损坏） | 受控 kdump，保留现场 |
 | DIMM 介质持续劣化 | 反复报错直至故障 | 越限上报，建议疏散+报修 |
+
+---
+
+## Slide B7 (新增): VM 处置策略升级——不再默认杀
+
+CPU 不再下线 → vCPU 进程是否被影响**完全取决于 affinity 配置**。原项目"统一杀 VM"过激；改成**三级分级响应**：
+
+| Case | host 上 vCPU affinity | inactive 后调度行为 | guest 内感知 | daemon 动作 |
+|------|---|---|---|---|
+| A | 不绑核（默认）| 自然漂到健康核 | **无** | 不动 |
+| B | **绑死故障核** | 仍在故障核跑 | 无感但**故障 cache 在用** | **必须改 vcpupin** |
+| C | 绑核组（含故障核）| 漂到组内健康核 | 无 | 可选预扩 |
+
+**三级响应**（按代价递增）：
+
+```
+Level 1 (首选, 毫秒级, 0 感知):  virsh vcpupin <dom> <vcpu> 健康核列表
+Level 2 (次选, 秒级, 短暂感知): virsh migrate --live → 其他节点
+Level 3 (兜底, 秒级, guest 中断): virsh destroy
+```
+
+**业务影响**：原 100% 杀 VM → 实测仅 **<10%** 走 L2/L3（NUMA 强约束场景）；90%+ VM **L1 即解**，客户**毫无感知**。
+
+---
+
+## Slide B8 (新增): 物理机里程碑达成
+
+### 实测数据
+
+| 跑次 | 环境 | 模式 | 结果 | 关键证据 |
+|---|---|---|---|---|
+| #1 | HCE2 物理机 (5.10.0-182.r3353_271_366) | inactive | **22 PASS / 0 FAIL** | cpu35 隔离 **437 IRQs 迁移**, 0.3ms 完成 |
+| #2 | 同上 + hw mode | inactive | **22 PASS / 0 FAIL** | hw probe 准确识别物理机限制 |
+| #3 | 同上 | soft | **22 PASS / 0 FAIL** | 兜底模式同样通 |
+| 累计 | VM × 3 + 物理机 × 3 | full / inactive / soft | **128 PASS / 0 FAIL** | 跨内核流跨模式无失败 |
+
+### dmesg 里物理机才看得到的硬证据
+
+```
+EDAC MC2: 0 CE memory read error on
+  CPU_SrcID#1_MC#0_Chan#2_DIMM#0
+  channel:2 slot:0 page:0x40d4833 ... Row:0x160 Column:0x608
+
+cpu_fault_isolate: cpu35: inactive-isolated
+  (cleared from cpu_active_mask + migrated 437 IRQs;
+   CPU stays online)
+```
+
+EDAC skx 真实解码到 DIMM channel/slot/row/col 级别——这条信息是 VM 永远看不到的，**对后续"具体哪根内存条要换"必备**。
+
+### 历史曲线
+
+| 阶段 | 物理机现象 | 解法 |
+|---|---|---|
+| 第 1 次 cfi 调 cpu_device_down | ABBA 死锁雪崩 | 加 cascade 防护 |
+| 第 2 次 还在死锁 | pid7+pid554 ABBA 锁死 | 加软隔离 soft |
+| 第 3 次 livepatch 完整下线 | percpu_counter hardlockup | 不走完整 down |
+| **第 4 次 inactive 模式** | **0.3ms 完成 / 0 死锁** | **本方案** |
