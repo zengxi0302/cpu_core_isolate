@@ -84,7 +84,7 @@ bypass 让 cpu71 真的下线了（dmesg `smpboot: CPU 71 is now offline`），
 测试改用中段安全 CPU（非 cpu0、非末位），A4b–A7 关 `auto_isolate` 只验
 分类记账，隔离能力由 A4 单独验证；重新上线走稳健重试函数。
 
-## 1.3 完整下线在 HCE2 上仍死锁 → 软隔离（最终方案）
+## 1.3 完整下线在 HCE2 上仍死锁 → 三档隔离模式（最终方案）
 
 加固后第二次实测：`cpu36` 真的下线了（`smpboot: CPU 36 is now offline`），
 但 `cfi_offline_work_fn` 的 kworker 仍 D 住、整机再次雪崩。剖析两个 D 进程：
@@ -107,27 +107,52 @@ work 争 `cpus_rwsem`）的固有缺陷。厂商把 `cpu_subsys_offline` 打桩�
 `cfi_hotplug` 加 `WQ_MEM_RECLAIM` 是错的（reclaim wq 不应 flush 非 reclaim
 wq），已去掉。
 
-**结论与最终方案**：完整 hotplug offline 在该机型不可用。新增**软隔离**
-模式（模块参数 `soft_isolation`，物理机置 1）：
+**结论**：完整 hotplug offline 在该机型不可用。但只迁中断（软隔离）的
+强度有上限——调度器仍会向故障核派 user/kernel 任务。新增**第三档
+INACTIVE 模式**：把故障核从 `cpu_active_mask` 移除 + 迁中断，CPU 仍 online，
+但调度器停止派新任务、load balancer 把已有可迁移任务推走（数毫秒内完成）。
 
-- `cfi_soft_isolate_cpu()` 遍历 `nr_irqs`，对 affinity 含故障核的中断用
-  `irq_get_irq_data()` + `irq_set_affinity()` 把它迁到其余在线核（保留原
-  policy，仅剔除故障核；managed/per-cpu 中断迁不动则跳过）。**全程不碰
-  `cpus_rwsem`/cpuset/hotplug 状态机，从机制上不可能死锁**。
-- CPU 保持 online，state 标记 ISOLATED；任务/vCPU 迁移交给 daemon（它知道
-  哪些 qemu 线程绑在该核），与项目「内核检测+上报、daemon 迁移」的总体
-  分工一致。
-- `soft_isolation` 默认 N（保持 VM 完整下线验证不变）；物理机/宿主机务必
-  置 1。加载时 dmesg 打印 `isolation mode: SOFT/OFFLINE`。
+### 1.3.1 INACTIVE 模式的实现路径
 
-| 模式 | 机制 | 适用 | 死锁风险 |
-|------|------|------|---------|
-| `soft_isolation=0`（默认） | hotplug offline（remove_cpu→bypass） | 裸 VM / 未定制内核 | HCE2 等定制内核上**会死锁** |
-| `soft_isolation=1` | 中断迁移 + 标记 + 上报，CPU 不下线 | 物理机 / 宿主机 | 无（不碰 cpus_rwsem） |
+`set_cpu_active(cpu, false)` 是上游 API，但在 HCE 5.10 内核里被 inline，
+kallsyms 里查不到（实测）；它操作的 `__cpu_active_mask` 反而是
+`EXPORT_SYMBOL`。我们直接 `cpumask_clear_cpu(cpu, cpu_active_mask)` 等价
+于 set_cpu_active(false) 对调度器的影响，**完全不依赖 kprobe，编译时 link
+就拿到**。
 
-`run_real_inject.sh` 默认以 `soft_isolation=1` 加载（物理机脚本），A4 据此
-校验「state=isolated 且 online 仍为 1 且 dmesg 有 soft-isolated 迁移 N 个
-中断」；传 `--offline` 可在确知安全的环境强制完整下线。
+放弃了 `set_cpu_active` 同时更新的 `sched_smt_active` 计数：那个只影响 SMT
+兄弟核协同调度的启发式，对"故障核不被选中"这个目标不是 load-bearing。
+
+### 1.3.2 为什么 INACTIVE 模式不死锁
+
+HCE2 的 ABBA 死锁需要三件事同时成立：(a) 调用持有 `cpus_write_lock` 的
+API；(b) 进入 CPU-hotplug 状态机；(c) 用 `work_on_cpu(target_cpu, ...)` 把
+work 排到正在下线 CPU 的 events 池。INACTIVE 路径**三个都不沾**：
+
+- `cpumask_clear_cpu` 是 atomic bit clear，无锁；
+- 不进 `_cpu_down` 状态机，所以不会触发 `cpuset_hotplug_workfn` 调度；
+- 不调用任何 `work_on_cpu`。
+
+### 1.3.3 隔离强度对比
+
+| 模式 | 机制 | User-mode tasks | 内核态非 per-cpu tasks | 中断 | per-cpu kthread | 死锁风险 |
+|------|------|---|---|---|---|---|
+| `full` | hotplug offline | 不调度 ✓ | 不调度 ✓ | 不投递 ✓ | 退出 ✓ | HCE2 上**会死锁** |
+| `inactive`（推荐） | `cpumask_clear(cpu_active)` + 迁中断 | 不调度 ✓ | 不调度 ✓ | 不投递 ✓ | 仍跑（idle/short） | **无** |
+| `soft`（最弱） | 仅迁中断 | 仍可能调度 ✗ | 仍可能调度 ✗ | 不投递 ✓ | 仍跑 | **无** |
+
+`inactive` 与 `full` 的差距仅在「per-cpu kthread 还会跑」一项；这些都是
+idle/migration/ksoftirqd/cpuhp/rcu_sched，几乎不消耗故障 cache，对"避免
+再次 MCE/panic"目标 ≥ 99% 等价 `full`。
+
+### 1.3.4 模块参数
+
+- 新参数 `isolation_mode=full|inactive|soft`（charp，默认 `full`）。
+- 旧参数 `soft_isolation`（bool）保留作为 deprecated 别名：=1 强制 SOFT。
+- VM 一键脚本沿用默认 `full`（VM 上没有该死锁）；
+- 物理机一键 `run_real_inject.sh` 默认 `--mode=inactive`；
+  `--mode=full` / `--mode=soft` / `--offline` 可显式覆盖。
+- 加载时 dmesg 打印 `isolation mode: <name>` 与该模式描述行。
 
 ## 2. 本开发环境的编译验证矩阵
 
@@ -176,3 +201,109 @@ panic 出自甄别引擎。
 
 VM 内天然测不到（物理机阶段）：真实 MCE 硬件通路、EDAC DIMM 定位、
 patrol scrub、EINJ、HCE3 FMA 钩子。
+
+## 5. 物理机验证指南（INACTIVE 模式）
+
+适用于已在物理机上撞过完整下线死锁（pid7 `cpu_device_down` D 住 + pid554
+`cpuset_hotplug_workfn` D 住）或 percpu_counter hardlockup 的 HCE2 物理机。
+本节默认 git 上已 fast-forward 到含本次改动的最新 commit。
+
+### 5.1 编译与加载
+
+```bash
+cd /path/to/cpu_core_isolate     # 你的物理机本地仓库
+git pull                          # 拉到本次提交
+
+# 二进制构建（kernel-devel/gcc/make 须就绪）
+make -C kernel KDIR=/lib/modules/$(uname -r)/build
+make -C test/tools
+
+# 卸载旧的，加载新的 (inactive)
+rmmod cpu_fault_isolate 2>/dev/null
+modprobe mce_inject hwpoison_inject
+
+# 显式指定模式，避免误用 full 撞死锁
+insmod kernel/cpu_fault_isolate.ko isolation_mode=inactive
+
+# 确认模式生效
+dmesg | tail -20 | grep -E "isolation mode|inactive"
+# 期望看到:
+#   cpu_fault_isolate: isolation mode: inactive
+#   cpu_fault_isolate:   (set_cpu_active(false) + IRQ migration — recommended for HCE2 physical hosts)
+
+cat /sys/module/cpu_fault_isolate/parameters/isolation_mode
+# 期望: inactive
+```
+
+### 5.2 单点 A4 烟雾测试（最重要的一项，先验证不死锁）
+
+挑一个非 cpu0、非末位的核做隔离目标，避开物理机 housekeeping CPU：
+
+```bash
+TGT=$(( $(nproc) / 2 ))   # 例如 72 核机器上是 cpu36
+
+# 注入 L2 cache UCE 触发隔离
+mount -t debugfs none /sys/kernel/debug 2>/dev/null
+echo "cpu=$TGT type=cache_l2 severity=ucr" > /sys/kernel/debug/cfi/inject
+sleep 2
+
+# 期望状态
+echo "cfi state:      $(cat /sys/devices/system/cpu/cpu$TGT/cfi/state)"   # → isolated
+echo "online:         $(cat /sys/devices/system/cpu/cpu$TGT/online)"      # → 1 (仍 online!)
+echo "online_mask:    $(cat /sys/devices/system/cpu/online)"
+# 检查 cpu_active_mask 已剔除 TGT（间接 — 看调度器是否还派任务给它）
+```
+
+dmesg 应看到（**没有** D 住进程，**没有** `WARNING: WQ_MEM_RECLAIM`，**没有**
+hardlockup）：
+```
+cpu_fault_isolate: cpuN: online -> isolating (...)
+cpu_fault_isolate: cpuN: inactive-isolating (sched_active=false + IRQ migration)
+cpu_fault_isolate: cpuN: inactive-isolated (cleared from cpu_active_mask + migrated K IRQs; CPU stays online)
+cpu_fault_isolate: cpuN: isolated successfully via inactive (total isolations: 1)
+```
+
+观测窗口（隔离后 30s 内）：
+```bash
+top -p 0 -d 5            # cpu$TGT 的 %us+%sy 应迅速降到接近 0
+cat /proc/stat | awk -v c=$TGT 'NR==c+2 {print}'   # 看 user+system 增长应停滞
+ps -eo psr,pid,comm | awk -v c=$TGT '$1==c'        # 应该几乎为空（只剩 per-cpu kthread）
+```
+
+判定：**没有死锁、没有重启、cpu 真的不再被调度** → 通过。
+
+### 5.3 全套真实硬件路径验证
+
+```bash
+bash test/run_real_inject.sh                  # 默认 --mode=inactive
+bash test/run_real_inject.sh --hw             # 加 hw 注入（物理机上 #MC 是真实的）
+bash test/run_real_inject.sh --mode=soft      # 对比：仅迁中断（旧默认）
+# 物理机上不要跑 --mode=full / --offline，会死锁
+```
+
+artifact 落 `/home/cfi_logs/`：`real_inject_report.txt`、`real_inject_dmesg.txt`、
+`real_inject_cfimon.log`。A4 在 inactive 模式下应输出 `state=isolated online=1
+cleared from cpu_active_mask + migrated N IRQs`。
+
+### 5.4 解隔离
+
+```bash
+# rmmod 时会调 cfi_unisolate_cpu 对所有隔离 CPU 自动回滚
+rmmod cpu_fault_isolate
+# 或运行时单点回滚（需 daemon/CLI 支持，目前以 rmmod 整体回滚为主）
+```
+
+dmesg 期望：
+```
+cpu_fault_isolate: cpuN: inactive isolation cleared (re-added to cpu_active_mask)
+```
+
+### 5.5 失败排查
+
+| 现象 | 原因 / 处置 |
+|------|-----|
+| 加载时 `isolation mode: full` 但参数 `inactive` | 命令行错；检查 `cat /sys/module/.../parameters/isolation_mode` |
+| 隔离后 cpu 还有任务 | per-cpu kthread 正常；user task 检查 `taskset -p <pid>` 是否被绑死 |
+| 解隔离后 cpu 仍空闲 | scheduler 域域未重建是预期；任务自然落到 `cpu_active_mask` 重新涵盖的核 |
+| pid `D` 在 `cpu_device_down` 路径 | 用错模式（full/offline）；改 inactive |
+| dmesg 出现 `cleared from cpu_active_mask` 但 `cpu_active_mask` 文件不变 | sysfs 没有 `cpu_active_mask` 文件，要通过观测调度行为间接验证 |

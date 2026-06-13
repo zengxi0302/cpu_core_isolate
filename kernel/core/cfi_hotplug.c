@@ -84,6 +84,20 @@ static cfi_cpu_dev_fn  cfi_cpu_device_up;	/* bypasses cpu_subsys_online */
 static cfi_cpu_down_fn cfi_cpu_down;		/* bypasses cpu_device_down */
 static cfi_cpu_down_fn cfi_cpu_up;		/* bypasses cpu_device_up */
 
+/*
+ * INACTIVE isolation backend.
+ *
+ * set_cpu_active(cpu, false) is the upstream API to make the scheduler
+ * stop picking a CPU. On HCE 2.0 / 5.10 (and several other vendor 5.x
+ * kernels) set_cpu_active is inlined and not present in kallsyms, so we
+ * cannot resolve it via kprobe. But the data it manipulates,
+ * __cpu_active_mask, is EXPORT_SYMBOL — and the bit it flips is the only
+ * state the scheduler actually consults. Doing the bit flip directly
+ * with cpumask_clear_cpu() is equivalent for our purposes (skipping only
+ * the sched_smt_active accounting, which controls SMT-aware sibling
+ * scheduling heuristics, not whether a CPU can be picked at all).
+ */
+
 /* Resolve an unexported symbol's address via a throwaway kprobe. */
 static unsigned long cfi_lookup_name(const char *name)
 {
@@ -112,6 +126,24 @@ static void cfi_resolve_offline_bypass(void)
 		cfi_cpu_device_up ? "ok" : "no",
 		cfi_cpu_down ? "ok" : "no",
 		cfi_cpu_up ? "ok" : "no");
+}
+
+/*
+ * Resolve isolation_mode= string to enum. INACTIVE is always available
+ * because it uses the exported __cpu_active_mask directly.
+ */
+static void cfi_select_isolation_mode(const char *requested)
+{
+	if (cfi_soft_isolation) {
+		pr_warn("soft_isolation=1 is deprecated; use isolation_mode=soft\n");
+		cfi_isolation_mode = CFI_ISOL_SOFT;
+	} else if (requested && !strcasecmp(requested, "inactive")) {
+		cfi_isolation_mode = CFI_ISOL_INACTIVE;
+	} else if (requested && !strcasecmp(requested, "soft")) {
+		cfi_isolation_mode = CFI_ISOL_SOFT;
+	} else {
+		cfi_isolation_mode = CFI_ISOL_FULL;
+	}
 }
 
 /*
@@ -294,11 +326,20 @@ int cfi_hotplug_init(void)
 
 	/* Resolve the deeper offline entry points for the stub-bypass path */
 	cfi_resolve_offline_bypass();
+	cfi_select_isolation_mode(cfi_isolation_mode_str);
 
-	pr_info("isolation mode: %s\n",
-		cfi_soft_isolation ?
-		"SOFT (IRQ migration, CPU stays online — safe on vendor kernels)" :
-		"OFFLINE (cpu hotplug down — VM / non-stubbed hosts only)");
+	pr_info("isolation mode: %s\n", cfi_isolation_mode_name(cfi_isolation_mode));
+	switch (cfi_isolation_mode) {
+	case CFI_ISOL_FULL:
+		pr_info("  (cpu hotplug down — VM / non-stubbed hosts only; may deadlock on HCE2 physical)\n");
+		break;
+	case CFI_ISOL_INACTIVE:
+		pr_info("  (set_cpu_active(false) + IRQ migration — recommended for HCE2 physical hosts)\n");
+		break;
+	case CFI_ISOL_SOFT:
+		pr_info("  (IRQ migration only — daemon must migrate tasks/vCPUs)\n");
+		break;
+	}
 	return 0;
 }
 
@@ -319,22 +360,17 @@ static void cfi_queue_offline(struct cfi_cpu_info *ci)
 }
 
 /*
- * Soft isolation: steer every movable IRQ off the faulty CPU and leave
- * it in cpu_online_mask. This never touches cpus_rwsem / the CPU hotplug
- * state machine, so it cannot hit the cpu_down() deadlock seen on vendor
- * kernels (HCE2: work_on_cpu-wrapped _cpu_down racing cgroup-v1 cpuset
- * hotplug for cpus_read_lock). Task/vCPU migration is the daemon's job
- * (it knows which qemu threads are pinned where); the kernel side just
- * removes interrupt load and reports. Best-effort: managed/per-CPU IRQs
- * that cannot be moved are skipped.
+ * Steer every movable IRQ off @cpu. Returns count of IRQs successfully
+ * migrated (purely informational). Shared by the SOFT and INACTIVE modes.
+ * Best-effort: managed/per-CPU IRQs that cannot be moved are skipped.
  */
-static int cfi_soft_isolate_cpu(unsigned int cpu)
+static unsigned int cfi_migrate_irqs_off_cpu(unsigned int cpu)
 {
 	cpumask_var_t mask;
 	unsigned int irq, moved = 0;
 
 	if (!zalloc_cpumask_var(&mask, GFP_KERNEL))
-		return -ENOMEM;
+		return 0;
 
 	for (irq = 0; irq < nr_irqs; irq++) {
 		struct irq_data *d = irq_get_irq_data(irq);
@@ -362,9 +398,74 @@ static int cfi_soft_isolate_cpu(unsigned int cpu)
 	}
 
 	free_cpumask_var(mask);
+	return moved;
+}
+
+/*
+ * Soft isolation: IRQ migration only. The CPU stays online; the daemon
+ * is responsible for moving tasks/vCPUs off it. Never touches cpus_rwsem
+ * or the hotplug state machine, so it cannot deadlock. Weakest of the
+ * three modes; kept for kernels where set_cpu_active is not resolvable.
+ */
+static int cfi_soft_isolate_cpu(unsigned int cpu)
+{
+	unsigned int moved = cfi_migrate_irqs_off_cpu(cpu);
+
 	pr_info("cpu%u: soft-isolated (migrated %u IRQs; CPU stays online, daemon migrates tasks/vCPUs)\n",
 		cpu, moved);
 	return 0;
+}
+
+/*
+ * Inactive isolation: clear @cpu from cpu_active_mask + migrate its IRQs.
+ * The CPU stays in cpu_online_mask, but the scheduler stops picking it
+ * for new tasks and the load balancer drifts existing migratable tasks
+ * off it within a few rebalance ticks (~ms). Per-CPU kthreads (idle,
+ * ksoftirqd, migration/N, cpuhp/N) remain bound but they are short-burst
+ * / mostly idle, so the faulty cache effectively stops being used.
+ *
+ * Why this is safe vs the FULL-hotplug deadlock seen on HCE2:
+ *   - We never call any function that takes cpus_write_lock.
+ *   - We never enter the CPU-hotplug state machine, so we never call
+ *     cpuset_hotplug_workfn-scheduling helpers.
+ *   - We never use work_on_cpu(target_cpu, ...), so we never queue work
+ *     to the "being-isolated" CPU's events pool.
+ * The known HCE2 deadlock chain (work_on_cpu(target)+cpuset_hotplug_workfn
+ * +cpus_rwsem ABBA) requires all three of those; we trip none.
+ *
+ * Trade-off: we skip the sched_smt_active accounting that the inlined
+ * set_cpu_active() also updates. That counter affects SMT-aware sibling
+ * scheduling heuristics, not whether a CPU is eligible at all — so this
+ * is non-load-bearing for the "stop dispatching to the faulty CPU" goal.
+ */
+static int cfi_inactive_isolate_cpu(unsigned int cpu)
+{
+	unsigned int moved;
+
+	/*
+	 * cpu_active_mask is declared `const`; the underlying storage
+	 * __cpu_active_mask is writable and gets mutated by set_cpu_active()
+	 * upstream the same way. Cast off const at the API boundary.
+	 */
+	cpumask_clear_cpu(cpu, (struct cpumask *)cpu_active_mask);
+
+	moved = cfi_migrate_irqs_off_cpu(cpu);
+
+	pr_info("cpu%u: inactive-isolated (cleared from cpu_active_mask + migrated %u IRQs; CPU stays online)\n",
+		cpu, moved);
+	return 0;
+}
+
+/*
+ * Reverse of cfi_inactive_isolate_cpu: re-add to cpu_active_mask. IRQs
+ * are not restored — irqbalance / the kernel rebalances affinity over
+ * time, matching SOFT-mode unisolate behaviour.
+ */
+static void cfi_inactive_unisolate_cpu(unsigned int cpu)
+{
+	cpumask_set_cpu(cpu, (struct cpumask *)cpu_active_mask);
+	pr_info("cpu%u: inactive isolation cleared (re-added to cpu_active_mask)\n",
+		cpu);
 }
 
 /*
@@ -390,21 +491,17 @@ void cfi_offline_work_fn(struct work_struct *work)
 		return;
 	}
 
-	if (cfi_soft_isolation) {
+	if (cfi_isolation_mode == CFI_ISOL_SOFT) {
 		pr_info("cpu%u: soft-isolating (IRQ migration)\n", cpu);
 		ret = cfi_soft_isolate_cpu(cpu);
+		goto report_mark;
+	}
 
-		spin_lock_irqsave(&ci->lock, flags);
-		if (ret == 0) {
-			ci->state = CFI_STATE_ISOLATED;
-			ci->isolation_count++;
-		} else {
-			ci->state = CFI_STATE_FAILED;
-			pr_err("cpu%u: soft isolation failed: %d\n", cpu, ret);
-		}
-		spin_unlock_irqrestore(&ci->lock, flags);
-		cfi_nl_send_state_change(cpu, ci->state);
-		return;
+	if (cfi_isolation_mode == CFI_ISOL_INACTIVE) {
+		pr_info("cpu%u: inactive-isolating (sched_active=false + IRQ migration)\n",
+			cpu);
+		ret = cfi_inactive_isolate_cpu(cpu);
+		goto report_mark;
 	}
 
 	pr_info("cpu%u: taking offline\n", cpu);
@@ -424,15 +521,18 @@ void cfi_offline_work_fn(struct work_struct *work)
 	ret = cfi_cpu_do_offline(cpu);
 	atomic_dec(&cfi_offline_inflight);
 
+report_mark:
 	spin_lock_irqsave(&ci->lock, flags);
 	if (ret == 0) {
 		ci->state = CFI_STATE_ISOLATED;
 		ci->isolation_count++;
-		pr_info("cpu%u: isolated successfully (total isolations: %u)\n",
-			cpu, ci->isolation_count);
+		pr_info("cpu%u: isolated successfully via %s (total isolations: %u)\n",
+			cpu, cfi_isolation_mode_name(cfi_isolation_mode),
+			ci->isolation_count);
 	} else {
 		ci->state = CFI_STATE_FAILED;
-		pr_err("cpu%u: failed to offline: %d\n", cpu, ret);
+		pr_err("cpu%u: isolation failed (%s): %d\n",
+		       cpu, cfi_isolation_mode_name(cfi_isolation_mode), ret);
 	}
 	spin_unlock_irqrestore(&ci->lock, flags);
 
@@ -579,19 +679,28 @@ int cfi_unisolate_cpu(unsigned int cpu)
 	spin_unlock_irqrestore(&ci->lock, flags);
 
 	/*
-	 * Soft-isolated CPUs were never offlined — they only had their IRQs
-	 * steered away (which the kernel/irqbalance rebalances over time).
-	 * Nothing to hotplug back; just clear our bookkeeping.
+	 * Restore depends on isolation mode:
+	 *   SOFT     — only IRQs were steered; nothing to undo besides
+	 *              bookkeeping (irqbalance will rebalance affinity).
+	 *   INACTIVE — flip set_cpu_active back to true; IRQs left as-is
+	 *              for the same reason.
+	 *   FULL     — bring the CPU back via add_cpu()/bypass.
 	 */
-	if (cfi_soft_isolation) {
+	switch (cfi_isolation_mode) {
+	case CFI_ISOL_SOFT:
 		pr_info("cpu%u: clearing soft isolation\n", cpu);
-	} else {
+		break;
+	case CFI_ISOL_INACTIVE:
+		cfi_inactive_unisolate_cpu(cpu);
+		break;
+	case CFI_ISOL_FULL:
 		pr_info("cpu%u: bringing back online\n", cpu);
 		ret = cfi_cpu_do_online(cpu);
 		if (ret) {
 			pr_err("cpu%u: failed to bring online: %d\n", cpu, ret);
 			return ret;
 		}
+		break;
 	}
 
 	spin_lock_irqsave(&ci->lock, flags);

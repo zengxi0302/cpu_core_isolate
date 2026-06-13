@@ -36,17 +36,24 @@ MEM=/sys/kernel/cfi/mem
 
 PASS=0; FAIL=0; SKIP=0
 WITH_HW=0
-# 物理机默认软隔离: 该机型完整 cpu_down() 会死锁(work_on_cpu 包装 _cpu_down
-# + cgroup-v1 cpuset hotplug 争 cpus_rwsem)。软隔离迁中断+上报, 不碰 hotplug。
-# 传 --offline 可强制完整下线 (仅在确知不死锁的环境, 如裸 VM)。
-SOFT=1
+# 默认隔离模式: inactive
+#   - VM/裸金属上工作良好(也可以选 full 走完整 cpu_down)
+#   - 物理机上避开 HCE2 完整 cpu_down 的 ABBA 死锁
+# 显式覆盖: --mode=full|inactive|soft 或 --offline (= full) / --soft
+MODE=inactive
 for a in "$@"; do
     case "$a" in
-        --hw)      WITH_HW=1 ;;
-        --offline) SOFT=0 ;;
-        --soft)    SOFT=1 ;;
+        --hw)             WITH_HW=1 ;;
+        --offline|--full) MODE=full ;;
+        --soft)           MODE=soft ;;
+        --inactive)       MODE=inactive ;;
+        --mode=*)         MODE="${a#--mode=}" ;;
     esac
 done
+case "$MODE" in
+    full|inactive|soft) ;;
+    *) echo "unknown --mode=$MODE (full|inactive|soft)"; exit 2 ;;
+esac
 
 log()  { echo "$*" | tee -a "$REPORT"; }
 ok()   { PASS=$((PASS+1)); log "  [PASS] $*"; }
@@ -98,10 +105,15 @@ modprobe hwpoison_inject 2>&1 | tee -a "$REPORT"
                                || skip "hwpoison-inject debugfs not present"
 
 # 装 CFI 模块 (测试用阈值)
-log "  isolation mode: $([[ $SOFT == 1 ]] && echo 'SOFT (IRQ migration)' || echo 'OFFLINE (cpu hotplug)')"
+log "  isolation mode: $MODE"
+case "$MODE" in
+    full)     log "    (cpu hotplug down — VM / non-stubbed hosts only)" ;;
+    inactive) log "    (set_cpu_active=false + IRQ migration — RECOMMENDED for HCE2 physical hosts)" ;;
+    soft)     log "    (IRQ migration only — daemon must migrate tasks; weakest mode)" ;;
+esac
 if insmod kernel/cpu_fault_isolate.ko ce_threshold=3 uce_threshold=1 \
         window_secs=60 defer_to_daemon=0 page_ce_threshold=3 \
-        mem_window_secs=300 mem_triage=0 soft_isolation=$SOFT 2>&1 | tee -a "$REPORT"; then
+        mem_window_secs=300 mem_triage=0 isolation_mode=$MODE 2>&1 | tee -a "$REPORT"; then
     ok "cfi module loaded"
 else
     bad "cfi module load failed"; exit 1
@@ -273,8 +285,22 @@ ST_AFT=$(cat /sys/devices/system/cpu/cpu$TC/cfi/state)
 ON_AFT=$(cat /sys/devices/system/cpu/cpu$TC/online)
 CE_AFT=$(cat /sys/devices/system/cpu/cpu$TC/cfi/uce_count 2>/dev/null || echo 0)
 log "  after:  cpu$TC state=$ST_AFT online=$ON_AFT uce_count=$CE_AFT"
-if [[ $SOFT == 1 ]]; then
-    # 软隔离: CPU 仍在线(online=1), state=isolated, 中断被迁走
+case "$MODE" in
+inactive)
+    # inactive: CPU 仍在线(online=1), state=isolated, cpu_active_mask 清除, 中断被迁走
+    if [[ "$ST_AFT" == isolated && "$ON_AFT" == 1 ]]; then
+        ok "MCE-chain L2 cache UCE -> CPU inactive-isolated (sched_active=false, no hotplug, no deadlock)"
+        M=$(dmesg | grep -m1 "cpu$TC: inactive-isolated")
+        [[ -n "$M" ]] && ok "  ${M#*cpu_fault_isolate: }" || log "  (inactive-isolate dmesg line not found)"
+    elif [[ $CE_AFT -gt $CE_BEF ]]; then
+        ok "L2 cache UCE accounted (uce_count delta=$((CE_AFT-CE_BEF)))"
+        bad "uce_count moved but state=$ST_AFT online=$ON_AFT, inactive isolation didn't fire"
+    else
+        bad "L2 cache UCE not visible (uce_count=0, dmesg may show details)"
+    fi
+    ;;
+soft)
+    # soft: CPU 仍在线(online=1), state=isolated, 中断被迁走
     if [[ "$ST_AFT" == isolated && "$ON_AFT" == 1 ]]; then
         ok "MCE-chain L2 cache UCE -> CPU soft-isolated (no hotplug, no deadlock)"
         M=$(dmesg | grep -m1 "cpu$TC: soft-isolated")
@@ -285,7 +311,8 @@ if [[ $SOFT == 1 ]]; then
     else
         bad "L2 cache UCE not visible (uce_count=0, dmesg may show details)"
     fi
-else
+    ;;
+full)
     # 完整下线: state=isolated, online=0
     if [[ "$ST_AFT" == isolated && "$ON_AFT" == 0 ]]; then
         ok "MCE-chain L2 cache UCE -> CPU isolated (offline)"
@@ -298,9 +325,10 @@ else
     else
         bad "L2 cache UCE not visible (uce_count=0, dmesg may show details)"
     fi
-fi
-# 完整下线模式需把 A4 隔离的 CPU 拉回; 软隔离模式 CPU 仍在线无需处理。
-[[ $SOFT == 0 ]] && reonline_cpu $TC
+    ;;
+esac
+# full 模式需把 A4 隔离的 CPU 拉回; inactive/soft 模式 CPU 仍在线无需处理。
+[[ "$MODE" == full ]] && reonline_cpu $TC
 sleep 1
 
 # 以下 A4b-A7 仅验证「真 MCE decode chain -> 各类错误分类记账」,
@@ -511,15 +539,16 @@ if [[ ${HW_AVAILABLE:-0} == 1 ]]; then
     ST_C1=$(cat /sys/devices/system/cpu/cpu$TCH/cfi/state)
     ON_C1=$(cat /sys/devices/system/cpu/cpu$TCH/online)
     log "    after:  cpu$TCH state=$ST_C1 online=$ON_C1 uce=$UC_C1"
-    EXP_ON=$([[ $SOFT == 1 ]] && echo 1 || echo 0)
+    EXP_ON=$([[ "$MODE" == full ]] && echo 0 || echo 1)
+    EXP_TAG=$([[ "$MODE" == full ]] && echo "" || echo "$MODE-")
     if [[ "$ST_C1" == isolated && "$ON_C1" == "$EXP_ON" ]]; then
-        ok "hw cache UCE -> #MC -> cfi cpu $([[ $SOFT == 1 ]] && echo soft-)isolation"
+        ok "hw cache UCE -> #MC -> cfi cpu ${EXP_TAG}isolation"
     elif [[ $UC_C1 -gt $UC_C0 ]]; then
-        bad "uce_count moved but no isolation (state=$ST_C1 online=$ON_C1)"
+        bad "uce_count moved but no isolation (state=$ST_C1 online=$ON_C1, expected mode=$MODE)"
     else
         bad "hw cache UCE not visible in CFI (decode chain not reached?)"
     fi
-    [[ $SOFT == 0 ]] && reonline_cpu $TCH
+    [[ "$MODE" == full ]] && reonline_cpu $TCH
     echo 0 > /sys/kernel/cfi/auto_isolate 2>/dev/null  # C5 仅记账
     sleep 1
 

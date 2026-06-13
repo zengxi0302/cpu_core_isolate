@@ -98,7 +98,37 @@ extern unsigned int cfi_mce_tolerant;
 extern unsigned int cfi_lockup_thresh_secs;
 extern bool cfi_offline_bypass;
 extern bool cfi_protect_cpu0;
-extern bool cfi_soft_isolation;
+extern bool cfi_soft_isolation;	/* deprecated alias for isolation_mode=soft */
+
+/*
+ * Isolation mechanism. Selected by the isolation_mode= modparam at load.
+ * Resolved once in cfi_hotplug_init().
+ *
+ *   FULL     — cpu hotplug offline via remove_cpu() / cpu_device_down.
+ *              Strongest. Works in plain VMs and bare-metal kernels that
+ *              haven't patched the offline path. Deadlocks on HCE2
+ *              physical-host kernels (work_on_cpu-wrapped _cpu_down +
+ *              cgroup-v1 cpuset_hotplug_workfn vs cpus_rwsem ABBA).
+ *
+ *   INACTIVE — set_cpu_active(cpu, false) + IRQ migration. The CPU stays
+ *              in cpu_online_mask but the scheduler stops picking it for
+ *              new tasks; existing migratable tasks drift off via load
+ *              balance. Never enters the hotplug state machine, so it
+ *              cannot hit the HCE2 deadlocks. Strength close to FULL for
+ *              the "fault cache stops being used" goal.
+ *
+ *   SOFT     — IRQ migration only (legacy). Weakest; daemon must drive
+ *              task/vCPU migration. Kept for environments where
+ *              set_cpu_active cannot be resolved.
+ */
+enum cfi_isol_mode {
+	CFI_ISOL_FULL = 0,
+	CFI_ISOL_INACTIVE,
+	CFI_ISOL_SOFT,
+};
+extern enum cfi_isol_mode cfi_isolation_mode;
+extern char *cfi_isolation_mode_str;	/* raw modparam string, pre-resolve */
+const char *cfi_isolation_mode_name(enum cfi_isol_mode m);
 
 /*
  * Global per-CPU info array (allocated in cfi_main.c).

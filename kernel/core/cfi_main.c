@@ -80,12 +80,33 @@ MODULE_PARM_DESC(protect_cpu0,
 bool cfi_soft_isolation = false;
 module_param_named(soft_isolation, cfi_soft_isolation, bool, 0644);
 MODULE_PARM_DESC(soft_isolation,
-	"Isolate by migrating IRQs off the faulty CPU + reporting, instead "
-	"of CPU hotplug offline. REQUIRED on vendor kernels where full "
-	"cpu_down() deadlocks (e.g. HCE2: work_on_cpu-wrapped _cpu_down + "
-	"cgroup-v1 cpuset hotplug vs cpus_rwsem). The CPU stays online; the "
-	"daemon migrates vCPUs/tasks off it. Never touches cpus_rwsem, so it "
-	"cannot deadlock the hotplug path (default: N)");
+	"DEPRECATED. Equivalent to isolation_mode=soft. Kept for backwards "
+	"compatibility; please switch to isolation_mode=. When set to 1 it "
+	"forces SOFT regardless of isolation_mode= (default: N)");
+
+char *cfi_isolation_mode_str = "full";
+module_param_named(isolation_mode, cfi_isolation_mode_str, charp, 0644);
+MODULE_PARM_DESC(isolation_mode,
+	"CPU isolation mechanism. 'full' = cpu hotplug offline (default; works "
+	"in VMs and bare-metal kernels without offline-path patches). 'inactive' "
+	"= set_cpu_active(false) + IRQ migration; CPU stays in cpu_online_mask "
+	"but the scheduler stops picking it. RECOMMENDED on HCE2 physical hosts "
+	"where full cpu_down() deadlocks (work_on_cpu-wrapped _cpu_down + "
+	"cgroup-v1 cpuset vs cpus_rwsem). 'soft' = IRQ migration only; weakest, "
+	"daemon must migrate tasks. Falls back from 'inactive' to 'soft' if "
+	"set_cpu_active is not resolvable on the running kernel.");
+
+enum cfi_isol_mode cfi_isolation_mode = CFI_ISOL_FULL;
+
+const char *cfi_isolation_mode_name(enum cfi_isol_mode m)
+{
+	switch (m) {
+	case CFI_ISOL_FULL:	return "full";
+	case CFI_ISOL_INACTIVE:	return "inactive";
+	case CFI_ISOL_SOFT:	return "soft";
+	default:		return "unknown";
+	}
+}
 
 /* --- Memory fault domain (MFI) parameters --- */
 
