@@ -1,26 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * CPU Fault Isolation (CFI) - Panic Suppression Layer
+ * CPU Fault Isolation (CFI) - MCE Panic Suppression Layer
  *
- * Prevents the kernel's default panic behavior for CPU faults that
- * CFI can handle via isolation. Instead of crashing the entire system,
- * we suppress the panic and let CFI isolate the faulting CPU.
+ * Scope: ONLY the hardware-MCE-induced panic path (mce_panic()).
  *
- * Suppresses:
- *   - softlockup_panic: kernel would panic on softlockup
- *   - hardlockup_panic: kernel would panic on hardlockup
- *   - MCE tolerant level: kernel would panic on fatal MCE
+ * Lockup panic knobs (softlockup_panic / hardlockup_panic) are NOT touched.
+ * Production HCE2 already runs softlockup_panic=0 (default) and
+ * hardlockup_panic=1 (default); whichever they're at, we leave them. Software
+ * lockups dominate >95% of the lockup cases, can't be hardware-isolated, and
+ * the kernel's own watchdog should still be free to act on them per the
+ * operator's policy.
+ *
+ * What we DO:
+ *   - Raise mca_cfg.tolerant so the kernel doesn't call panic() on fatal MCE.
+ *     CFI's notifier chain handler then performs the isolation.
+ *   - Register a panic_notifier_list logger (last-resort post-mortem trail,
+ *     fires only if everything else failed and the kernel still panics).
+ *   - On HCE3 kernels, register on mce_panic_chain for pre-panic logging.
  *
  * MCE tolerant setting strategy (two methods):
  *   Method 1: Write to /sys/.../tolerant sysfs (standard upstream kernels)
  *   Method 2: Direct kernel variable write via kprobe symbol lookup
  *             (fallback for HCE3/openEuler kernels that removed sysfs)
- *
- * HCE3 (Huawei Cloud EulerOS 3.0) adaptation:
- *   - Registers on mce_panic_chain (notify_mce_panic) as last-resort
- *     pre-panic logger, since HCE3 calls this before mce_panic().
- *
- * Also registers a generic panic notifier as a last-resort logger.
  */
 
 #define pr_fmt(fmt) "cpu_fault_isolate: " fmt
@@ -46,8 +47,6 @@
 #include <linux/kprobes.h>
 #include "cfi_internal.h"
 
-#define PROC_SOFTLOCKUP_PANIC	"/proc/sys/kernel/softlockup_panic"
-#define PROC_HARDLOCKUP_PANIC	"/proc/sys/kernel/hardlockup_panic"
 #define SYSFS_MCE_TOLERANT_FMT	"/sys/devices/system/machinecheck/machinecheck%u/tolerant"
 
 /*
@@ -69,8 +68,6 @@ static int cfi_mce_tolerant_path(char *buf, size_t buflen)
 	return 0;
 }
 
-static int orig_softlockup_panic = -1;
-static int orig_hardlockup_panic = -1;
 static int orig_mce_tolerant = -1;
 
 /*
@@ -264,35 +261,14 @@ int cfi_suppress_init(void)
 	int val, ret;
 	bool tolerant_set = false;
 
-	/* Suppress softlockup panic */
-	ret = cfi_read_int_file(PROC_SOFTLOCKUP_PANIC, &val);
-	if (ret == 0) {
-		orig_softlockup_panic = val;
-		if (val != 0) {
-			ret = cfi_write_int_file(PROC_SOFTLOCKUP_PANIC, 0);
-			if (ret == 0)
-				pr_info("suppressed softlockup_panic (was %d)\n", val);
-			else
-				pr_warn("failed to suppress softlockup_panic: %d\n", ret);
-		}
-	} else {
-		pr_info("softlockup_panic not available (%d)\n", ret);
-	}
-
-	/* Suppress hardlockup panic */
-	ret = cfi_read_int_file(PROC_HARDLOCKUP_PANIC, &val);
-	if (ret == 0) {
-		orig_hardlockup_panic = val;
-		if (val != 0) {
-			ret = cfi_write_int_file(PROC_HARDLOCKUP_PANIC, 0);
-			if (ret == 0)
-				pr_info("suppressed hardlockup_panic (was %d)\n", val);
-			else
-				pr_warn("failed to suppress hardlockup_panic: %d\n", ret);
-		}
-	} else {
-		pr_info("hardlockup_panic not available (%d)\n", ret);
-	}
+	/*
+	 * Intentionally do NOT touch softlockup_panic / hardlockup_panic.
+	 * Those knobs gate software-lockup behavior, which CFI cannot isolate
+	 * (lockups are overwhelmingly software bugs); leave them at whatever
+	 * the operator / distro default is. Production HCE2 already has
+	 * softlockup_panic=0 and hardlockup_panic=1, both of which we want
+	 * preserved.
+	 */
 
 	/*
 	 * Raise MCE tolerant level to prevent mce_panic().
@@ -341,7 +317,7 @@ int cfi_suppress_init(void)
 	/* HCE3: register on mce_panic_chain for pre-panic notification */
 	cfi_hce3_panic_chain_init();
 
-	pr_info("panic suppression active (mce_tolerant %s)\n",
+	pr_info("MCE panic suppression active (mce_tolerant %s; lockup panic knobs untouched)\n",
 		tolerant_set ? "set" : "FAILED");
 	return 0;
 }
@@ -363,10 +339,5 @@ void cfi_suppress_exit(void)
 			cfi_write_int_file(tolerant_path, orig_mce_tolerant);
 	}
 
-	if (orig_hardlockup_panic >= 0)
-		cfi_write_int_file(PROC_HARDLOCKUP_PANIC, orig_hardlockup_panic);
-	if (orig_softlockup_panic >= 0)
-		cfi_write_int_file(PROC_SOFTLOCKUP_PANIC, orig_softlockup_panic);
-
-	pr_info("restored original panic settings\n");
+	pr_info("restored original mce_tolerant\n");
 }

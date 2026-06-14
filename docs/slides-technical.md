@@ -49,10 +49,10 @@ MCE 中断
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│ 第1层: Panic 拦截 (模块加载时立即生效)              │
-│   • mce_tolerant=3 (kprobe直写内核变量)             │
-│   • softlockup_panic=0                              │
-│   • hardlockup_panic=0                              │
+│ 第1层: MCE Panic 拦截 (模块加载时立即生效)          │
+│   • mce_tolerant=3 (sysfs 或 kprobe 直写内核变量)   │
+│   • lockup_panic 不动 (软件锁死无法硬件隔离,        │
+│     保持现网 softlockup=0/hardlockup=1 默认)        │
 ├─────────────────────────────────────────────────────┤
 │ 第2层: 错误检测 (全量错误捕获)                      │
 │   • x86: MCE decode chain (高优先级)                │
