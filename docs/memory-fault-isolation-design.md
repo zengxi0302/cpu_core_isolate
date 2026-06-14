@@ -88,10 +88,10 @@ MFI 作为 `cpu_fault_isolate.ko` 内的新故障域（domain）实现，与 CPU
 ├──────────────────────────────┬──────────────────────────────────────┤
 │   CPU Fault Domain (CFI)     │   Memory Fault Domain (MFI)  ← 新增  │
 │                              │                                      │
-│  • Cache UCE → CPU offline   │  • Page Accounting（PFN 哈希表）     │
-│  • Lockup → CPU offline      │  • Page Pre-Isolation（soft offline）│
-│                              │  • UCE Triage（落点甄别, Phase 2）   │
-│                              │  • DIMM/Rank Accounting              │
+│  • Cache UCE → CPU 隔离      │  • Page Accounting（PFN 哈希表）     │
+│  • TLB/Bus/Internal → 隔离   │  • Page Pre-Isolation（soft offline）│
+│  • 三档隔离 (full/inactive/  │  • UCE Triage（落点甄别, Phase 2）   │
+│    soft)                     │  • DIMM/Rank Accounting              │
 ├──────────────────────────────┴──────────────────────────────────────┤
 │              共享基础设施（复用，少量扩展）                          │
 │                                                                      │

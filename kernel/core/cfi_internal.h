@@ -95,7 +95,6 @@ extern bool cfi_auto_isolate;
 extern bool cfi_defer_to_daemon;
 extern unsigned int cfi_defer_timeout_ms;
 extern unsigned int cfi_mce_tolerant;
-extern unsigned int cfi_lockup_thresh_secs;
 extern bool cfi_offline_bypass;
 extern bool cfi_protect_cpu0;
 extern bool cfi_soft_isolation;	/* deprecated alias for isolation_mode=soft */
@@ -152,8 +151,6 @@ void cfi_begin_isolation(unsigned int cpu, bool urgent);
 int  cfi_unisolate_cpu(unsigned int cpu);
 void cfi_offline_work_fn(struct work_struct *work);
 void cfi_defer_timer_fn(struct timer_list *t);
-/* True while a CPU offline is executing; lockup isolation must not pile on */
-bool cfi_offline_in_progress(void);
 /* True if this CPU must never be auto-isolated (e.g. CPU0 when protected) */
 bool cfi_cpu_is_protected(unsigned int cpu);
 
@@ -179,10 +176,6 @@ void cfi_daemon_ack_isolate(unsigned int cpu);
 /* --- cfi_panic_suppress.c --- */
 int  cfi_suppress_init(void);
 void cfi_suppress_exit(void);
-
-/* --- cfi_lockup.c --- */
-int  cfi_lockup_init(void);
-void cfi_lockup_exit(void);
 
 /* --- Arch backends (cfi_x86.c / cfi_arm64.c) --- */
 #ifdef CONFIG_X86

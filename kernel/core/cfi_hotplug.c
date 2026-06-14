@@ -58,14 +58,6 @@ static enum cpuhp_state cfi_hp_state;
  */
 static struct workqueue_struct *cfi_hotplug_wq;
 
-/* >0 while an offline is executing; read by the lockup detector. */
-static atomic_t cfi_offline_inflight = ATOMIC_INIT(0);
-
-bool cfi_offline_in_progress(void)
-{
-	return atomic_read(&cfi_offline_inflight) > 0;
-}
-
 bool cfi_cpu_is_protected(unsigned int cpu)
 {
 	return cfi_protect_cpu0 && cpu == 0;
@@ -513,13 +505,8 @@ void cfi_offline_work_fn(struct work_struct *work)
 	 * - Moves IRQs to other CPUs
 	 * - Stops per-CPU kernel threads
 	 * - Drains the CPU's run queue
-	 *
-	 * Mark an offline in flight so the lockup detector does not react to
-	 * the transient stalls a teardown causes by scheduling more offlines.
 	 */
-	atomic_inc(&cfi_offline_inflight);
 	ret = cfi_cpu_do_offline(cpu);
-	atomic_dec(&cfi_offline_inflight);
 
 report_mark:
 	spin_lock_irqsave(&ci->lock, flags);

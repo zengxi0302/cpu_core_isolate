@@ -16,8 +16,8 @@
 
 **触发场景**：
 - L1/L2/L3 Cache 不可纠正错误（UCE）
-- CPU 硬锁（NMI watchdog 触发）
-- CPU 软锁（scheduler 停转）
+- TLB / Bus / 微架构内部错误
+- 内存控制器报告的 DRAM UCE
 
 ---
 
@@ -28,7 +28,6 @@
 | 调高 tolerant sysfs | HCE3 内核**移除了**该 sysfs 属性 |
 | 注册 MCE decode chain | decode chain 在 `mce_panic()` **之后**才走到 |
 | EDAC/rasdaemon | 只做记录，不做隔离决策 |
-| 内核 watchdog | 抑制 panic 后只记日志，不下线 CPU |
 
 **时序图（核心矛盾）**：
 
@@ -59,7 +58,7 @@ MCE 中断
 │   • x86: MCE decode chain (高优先级)                │
 │   • x86: HCE3 FMA chain (额外早期通知)              │
 │   • arm64: GHES tracepoint                          │
-│   • 自建: hrtimer + kthread lockup 检测             │
+│   • EDAC mc_event (DIMM 物理拓扑解码)               │
 ├─────────────────────────────────────────────────────┤
 │ 第3层: 隔离执行 (确保在健康CPU上执行)               │
 │   • workqueue → remove_cpu()                        │
@@ -121,7 +120,7 @@ if (addr) {
 
 ## Slide 6: 关键技术点 — 跨 CPU 隔离
 
-**问题**：故障 CPU 可能处于 hardlockup，无法处理自己的 workqueue。
+**问题**：故障 CPU 可能无法处理自己的 workqueue。
 
 **方案**：
 
@@ -143,65 +142,44 @@ if (urgent && current_cpu == faulty_cpu) {
 
 ---
 
-## Slide 7: 独立 Lockup 检测
-
-抑制内核 watchdog panic 后，CFI 自建检测 + 隔离：
-
-```
-┌────────────────────────────────────────────────┐
-│  Softlockup 检测:                              │
-│    Per-CPU kthread 每4s更新时间戳               │
-│    Per-CPU hrtimer 检查时间戳是否过期(30s)      │
-│    过期 → cfi_report_error(SOFTLOCKUP, UCF)    │
-│                                                │
-│  Hardlockup 检测:                              │
-│    Per-CPU hrtimer 每4s递增 heartbeat           │
-│    Global monitor(另一CPU) 每5s检查所有 hb      │
-│    连续6次(30s)不变 → report(HARDLOCKUP, UCF)  │
-└────────────────────────────────────────────────┘
-          │
-          v  
-   Lockup 直接跳过阈值逻辑 → 立即 ISOLATING
-```
-
----
-
-## Slide 8: 状态机与阈值逻辑
+## Slide 7: 状态机与阈值逻辑
 
 ```
 ONLINE ──[CE >= 10]──> DEGRADED ──[UCE >= 1]──> ISOLATING ──> ISOLATED
   │                                                  │
   └──────────[UCE >= 1]──────────────────────────────┘
-  └──────────[Lockup]────────────────────────────────┘ (直接跳过阈值)
 ```
 
 **关键参数**（运行时可调）：
-- CE 阈值：10/窗口（默认1小时）
+- CE 阈值：10/窗口（默认 1 小时）
 - UCE 阈值：1（一次即触发）
-- Lockup：无需阈值，单次即隔离
 
 **Daemon 协作**：
-- 非紧急：等 daemon ACK（最多30s），让 daemon 先迁移 VM
-- 紧急（lockup/PCC）：立即下线，不等 daemon
+- 非紧急：等 daemon ACK（最多 30s），让 daemon 先迁移 VM
+- 紧急（PCC=1）：立即下线，不等 daemon
 
 ---
 
-## Slide 9: 模块架构与文件组织
+## Slide 8: 模块架构与文件组织
 
 ```
-cpu_fault_isolate.ko (单一模块，~2500 行 C)
+cpu_fault_isolate.ko (单一模块，~3000 行 C)
 ├── core/
 │   ├── cfi_main.c           # 入口、参数、init 编排
 │   ├── cfi_core.c           # 状态机、阈值引擎
-│   ├── cfi_hotplug.c        # CPU offline/online
+│   ├── cfi_hotplug.c        # CPU 三档隔离 (full/inactive/soft)
 │   ├── cfi_panic_suppress.c # panic 拦截 + HCE3 适配
-│   ├── cfi_lockup.c         # 独立 lockup 检测
 │   ├── cfi_netlink.c        # 用户态通信
 │   ├── cfi_sysfs.c          # sysfs 接口
-│   └── cfi_debugfs.c        # 测试注入
+│   ├── cfi_debugfs.c        # 测试注入
+│   ├── mfi_core.c           # 内存域：状态机 + 页记账
+│   ├── mfi_page.c           # 页隔离 (soft offline / memory_failure)
+│   ├── mfi_dimm.c           # DIMM 介质记账
+│   └── mfi_triage.c         # 内核态 UCE 落点甄别
 ├── arch/x86/
 │   ├── cfi_x86.c            # MCE handler + FMA
-│   └── cfi_x86_cache.c      # MCA 错误码分类
+│   ├── cfi_x86_cache.c      # MCA 错误码分类
+│   └── mfi_x86.c            # 内存 MCE 后端
 └── arch/arm64/
     ├── cfi_arm64.c           # GHES tracepoint
     └── cfi_arm64_cache.c     # ARM RAS 分类
@@ -209,7 +187,7 @@ cpu_fault_isolate.ko (单一模块，~2500 行 C)
 
 ---
 
-## Slide 10: 测试验证现状（已更新）
+## Slide 9: 测试验证现状（已更新）
 
 **累计 128 断言 / 0 FAIL**
 
@@ -236,7 +214,7 @@ cpu_fault_isolate: cpuN: isolated successfully via inactive (total isolations: 1
 
 ---
 
-## Slide 11: 后续计划（已更新）
+## Slide 10: 后续计划（已更新）
 
 | 里程碑 | 内容 | 状态 |
 |--------|------|------|
@@ -250,13 +228,13 @@ cpu_fault_isolate: cpuN: isolated successfully via inactive (total isolations: 1
 
 ---
 
-## Slide 12: 风险与缓解
+## Slide 11: 风险与缓解
 
 | 风险 | 影响 | 缓解 |
 |------|------|------|
 | kprobe 在某些内核配置下禁用 | tolerant 设不上 | 提供内核 patch 作为备选 |
 | tolerant=3 可能掩盖其他 fatal MCE | 理论上降低保护 | CFI 主动处理所有 MCE，比 panic 更精准 |
-| lockup CPU 上的 VM 可能已损坏 | 数据一致性 | 这是 "止损" 而非 "无损"，与直接 panic 相比仍是改善 |
+| 故障 CPU 上的 VM 数据损坏 | 必然 | 属于"止损"，与 panic 相比从 N 个 VM 降到 1 个 |
 | 模块 unload 时恢复不完整 | 残留低保护状态 | exit 路径严格恢复所有原值 |
 
 ---

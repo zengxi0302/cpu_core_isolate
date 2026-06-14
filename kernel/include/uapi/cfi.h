@@ -33,8 +33,6 @@ enum cfi_error_type {
 	CFI_ERR_BUS		= 0x20,	/* Bus/interconnect error */
 	CFI_ERR_INTERNAL	= 0x40,	/* Micro-architectural internal parity */
 	CFI_ERR_GENERIC_CORE	= 0x80,	/* Unclassified core-scoped error */
-	CFI_ERR_HARDLOCKUP	= 0x100,/* CPU not processing interrupts */
-	CFI_ERR_SOFTLOCKUP	= 0x200,/* CPU not scheduling */
 };
 
 /*

@@ -58,11 +58,6 @@ module_param_named(mce_tolerant, cfi_mce_tolerant, uint, 0644);
 MODULE_PARM_DESC(mce_tolerant,
 	"MCE tolerant level override: 1=recover SRAR, 3=never panic (default: 3)");
 
-unsigned int cfi_lockup_thresh_secs = 30;
-module_param_named(lockup_thresh, cfi_lockup_thresh_secs, uint, 0644);
-MODULE_PARM_DESC(lockup_thresh,
-	"Seconds without scheduler activity to declare softlockup (default: 30)");
-
 bool cfi_offline_bypass = true;
 module_param_named(offline_bypass, cfi_offline_bypass, bool, 0644);
 MODULE_PARM_DESC(offline_bypass,
@@ -203,9 +198,9 @@ static int __init cfi_init(void)
 	int ret;
 
 	pr_info("initializing (ce_thresh=%u uce_thresh=%u window=%us "
-		"mce_tolerant=%u lockup_thresh=%us)\n",
+		"mce_tolerant=%u)\n",
 		cfi_ce_threshold, cfi_uce_threshold, cfi_window_secs,
-		cfi_mce_tolerant, cfi_lockup_thresh_secs);
+		cfi_mce_tolerant);
 
 	ret = cfi_alloc_cpus();
 	if (ret) {
@@ -276,18 +271,9 @@ static int __init cfi_init(void)
 		goto err_arch;
 	}
 
-	/* Start lockup detection after everything else is ready */
-	ret = cfi_lockup_init();
-	if (ret) {
-		pr_err("failed to start lockup detection: %d\n", ret);
-		goto err_mfi;
-	}
-
-	pr_info("initialized successfully — panic suppression and lockup detection active\n");
+	pr_info("initialized successfully — panic suppression active\n");
 	return 0;
 
-err_mfi:
-	mfi_exit();
 err_arch:
 	if (cfi_arch && cfi_arch->exit)
 		cfi_arch->exit();
@@ -309,9 +295,6 @@ err_free_cpus:
 static void __exit cfi_exit(void)
 {
 	pr_info("unloading\n");
-
-	/* Stop lockup detection first (no more isolation triggers) */
-	cfi_lockup_exit();
 
 	/* Memory domain: unregister notifiers/probes, flush offline work */
 	mfi_exit();

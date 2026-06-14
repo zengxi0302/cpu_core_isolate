@@ -158,33 +158,6 @@ void cfi_report_error(struct cfi_error_event *event)
 		goto out;
 	}
 
-	/*
-	 * Lockup events bypass threshold logic entirely.
-	 * A single lockup is an immediate isolation trigger — the CPU is
-	 * already non-functional.
-	 *
-	 * But do NOT react while a CPU offline is already executing: tearing
-	 * a CPU down legitimately stalls other CPUs (IRQ migration, stop
-	 * machine, vendor work_on_cpu teardown) and their heartbeats go
-	 * briefly stale. Isolating those would pile more offlines onto an
-	 * in-progress one and deadlock the hotplug path. Skip; the monitor
-	 * re-evaluates next cycle once the offline settles.
-	 */
-	if (event->error_type & (CFI_ERR_HARDLOCKUP | CFI_ERR_SOFTLOCKUP)) {
-		if (cfi_cpu_is_protected(cpu) || cfi_offline_in_progress()) {
-			pr_warn_ratelimited("cpu%u: lockup signalled but %s; deferring isolation\n",
-					    cpu,
-					    cfi_cpu_is_protected(cpu) ?
-						"CPU protected" :
-						"an offline is in progress");
-			goto out;
-		}
-		cfi_transition(ci, cpu, CFI_STATE_ISOLATING);
-		spin_unlock_irqrestore(&ci->lock, flags);
-		cfi_begin_isolation(cpu, true);
-		return;
-	}
-
 	switch (ci->state) {
 	case CFI_STATE_ONLINE:
 		if (ci->uce_count >= cfi_uce_threshold) {

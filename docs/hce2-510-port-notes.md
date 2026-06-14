@@ -68,13 +68,7 @@ bypass 让 cpu71 真的下线了（dmesg `smpboot: CPU 71 is now offline`），
    **修复**：改用独立的有序工作队列 `alloc_ordered_workqueue("cfi_hotplug")`
    （`WQ_MEM_RECLAIM`），与 system_wq 隔离，且 `max_active=1` 串行化下线，
    unbound 池不会调度到已卡死的 CPU。
-2. **lockup 检测器雪崩**。下线过程本身会瞬时拖停其他 CPU（stop-machine /
-   IRQ 迁移 / `work_on_cpu` teardown），心跳变陈旧，我们的检测器误判为
-   lockup 又去隔离 cpu0/cpu5，往死锁上加码。
-   **修复**：新增 `cfi_offline_in_progress()`（in-flight 原子计数）；下线
-   执行期间 lockup 检测器整轮暂停、`cfi_report_error` 的 lockup 分支也直接
-   跳过，不标记 `lockup_reported`（避免永久屏蔽后续真实检测）。
-3. **cpu0 被卷入隔离**。cpu0 是 boot CPU，且在 HCE2 上正是 `work_on_cpu`
+2. **cpu0 被卷入隔离**。cpu0 是 boot CPU，且在 HCE2 上正是 `work_on_cpu`
    跑 teardown 的宿主，隔离它 = 自掘坟墓。
    **修复**：新增 `protect_cpu0`（默认 Y），`cfi_begin_isolation` 单一
    chokepoint 拒绝隔离受保护 CPU 与最后一个在线 CPU。

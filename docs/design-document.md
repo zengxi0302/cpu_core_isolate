@@ -16,8 +16,8 @@
 | 故障类型 | 内核默认行为 | 影响 |
 |---------|------------|------|
 | Cache UCE（L1/L2/L3 不可纠正错误） | `mce_panic()` → 整机宕机 | **所有 VM 全部丢失** |
-| 硬锁（Hardlockup） | `panic()` → 整机宕机 | **所有 VM 全部丢失** |
-| 软锁（Softlockup） | `panic()` → 整机宕机 | **所有 VM 全部丢失** |
+| TLB / Bus / Internal UCE | `mce_panic()` → 整机宕机 | **所有 VM 全部丢失** |
+| 内存 UCE 被内核态消费 | `mce_panic()` → 整机宕机 | **所有 VM 全部丢失** |
 
 **核心矛盾**：单个 CPU 核心故障 → 牵连整机 100+ 个核心上的所有 VM。
 
@@ -48,15 +48,15 @@
 │   Layer              │   & State Machine    │   Engine              │
 │                      │                      │                       │
 │  • mce_tolerant=3    │  • Per-CPU counters  │  • Deferred work      │
-│  • softlockup=0      │  • Sliding window    │  • remove_cpu()       │
-│  • hardlockup=0      │  • Threshold logic   │  • Daemon deferral    │
-│  • kprobe fallback   │  • State transitions │  • Cross-CPU sched    │
+│  • softlockup=0      │  • Sliding window    │  • full / inactive /  │
+│  • hardlockup=0      │  • Threshold logic   │    soft 三档隔离       │
+│  • kprobe fallback   │  • State transitions │  • Daemon deferral    │
 ├──────────────────────┼──────────────────────┼───────────────────────┤
-│  Lockup Detection    │   Netlink/Sysfs      │   Arch Backends       │
-│                      │   Interface          │                       │
-│  • hrtimer heartbeat │  • genl "CFI"        │  • x86: MCE decode    │
-│  • kthread watchdog  │  • Per-CPU sysfs     │  • x86: FMA (HCE3)   │
-│  • Global monitor    │  • debugfs inject    │  • arm64: GHES/APEI   │
+│  Memory Fault Domain │   Netlink/Sysfs      │   Arch Backends       │
+│  (MFI)               │   Interface          │                       │
+│  • 页 CE 预隔离       │  • genl "CFI"        │  • x86: MCE decode    │
+│  • UCE 异步硬下线    │  • Per-CPU sysfs     │  • x86: FMA (HCE3)   │
+│  • 内核态落点甄别     │  • debugfs inject    │  • arm64: GHES/APEI   │
 └──────────────────────┴──────────────────────┴───────────────────────┘
 ```
 
@@ -114,30 +114,9 @@ HCE3 内核额外提供了两个钩子：
 
 CFI 通过 kprobe 运行时探测这些符号，有则注册，无则跳过，保持对 upstream 内核的兼容。
 
-### 3.4 Lockup 检测（独立于内核 watchdog）
+### 3.4 跨 CPU 隔离调度
 
-抑制 `softlockup_panic` 和 `hardlockup_panic` 后，内核只记录 lockup 不采取行动。CFI 自建检测并触发隔离：
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Per-CPU hrtimer (4s)         Per-CPU kthread (4s)      │
-│  ┌─────────────────┐         ┌─────────────────┐       │
-│  │ atomic_inc(hb)  │         │ update jiffies  │       │
-│  │ check sched_ts  │──miss──>│ "softlockup!"   │       │
-│  └─────────────────┘         └─────────────────┘       │
-│           │                                             │
-│           │ Global Monitor (5s, runs on healthy CPU)    │
-│           │ ┌──────────────────────────┐                │
-│           └>│ for_each_online_cpu:     │                │
-│             │   if hb stale 30s:       │                │
-│             │     "hardlockup!"        │                │
-│             └──────────────────────────┘                │
-└─────────────────────────────────────────────────────────┘
-```
-
-### 3.5 跨 CPU 隔离调度
-
-故障 CPU 可能无法处理自己的 workqueue（hardlockup），因此隔离工作必须在健康 CPU 上执行：
+故障 CPU 可能无法处理自己的 workqueue，因此隔离工作必须在健康 CPU 上执行：
 
 ```c
 void cfi_begin_isolation(unsigned int cpu, bool urgent)
@@ -164,7 +143,6 @@ void cfi_begin_isolation(unsigned int cpu, bool urgent)
     └──────────┘                  └───────────┘      │
          │                              │            │
          │  UCE >= thresh               │ UCE >= thresh
-         │  or Lockup                   │            │
          v                              v            │
     ┌────────────┐               ┌────────────┐     │
     │ ISOLATING  │               │ ISOLATING  │     │
@@ -180,8 +158,6 @@ void cfi_begin_isolation(unsigned int cpu, bool urgent)
     └──────────────────────────────┴────────────────┘
 ```
 
-**Lockup 特殊路径**：跳过阈值逻辑，单次事件立即触发 ISOLATING。
-
 ---
 
 ## 5. 模块组成
@@ -192,7 +168,6 @@ void cfi_begin_isolation(unsigned int cpu, bool urgent)
 | `core/cfi_core.c` | 错误计数、状态机、阈值判断 | ~200 |
 | `core/cfi_hotplug.c` | CPU offline/online、daemon 协议 | ~260 |
 | `core/cfi_panic_suppress.c` | panic 拦截、tolerant 设置、HCE3 适配 | ~270 |
-| `core/cfi_lockup.c` | 独立 lockup 检测 | ~250 |
 | `core/cfi_netlink.c` | Generic netlink 通信 | ~270 |
 | `core/cfi_sysfs.c` | sysfs 接口 | ~280 |
 | `core/cfi_debugfs.c` | 软件错误注入 | ~295 |
@@ -216,7 +191,9 @@ void cfi_begin_isolation(unsigned int cpu, bool urgent)
 | `defer_to_daemon` | Y | 是否等 daemon ACK 再下线 |
 | `defer_timeout_ms` | 30000 | daemon ACK 超时（毫秒） |
 | `mce_tolerant` | 3 | MCE tolerant 目标值 |
-| `lockup_thresh` | 30 | lockup 检测阈值（秒） |
+| `isolation_mode` | full | CPU 隔离机制（full / inactive / soft）|
+| `offline_bypass` | Y | remove_cpu 失败时绕过 stubbed entries |
+| `protect_cpu0` | Y | 永不自动隔离 cpu0 |
 
 ### 6.2 Sysfs
 
