@@ -13,7 +13,8 @@
 set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
-status_banner "01 Memory CE (sw flag, bank=4, status=$STAT_MEM_CE)"
+parse_inject_args "$@"
+status_banner "01 Memory CE (bank=4, status=$STAT_MEM_CE)"
 require_mce_inject
 
 CE0=$(mfi_stat ce_total)
@@ -22,7 +23,7 @@ own_page mem_ce
 dmesg_mark
 
 for i in 1 2 3; do
-    mce_submit sw 4 "$STAT_MEM_CE" "$PADDR" 0 0
+    mce_inject_dispatch 0 4 "$STAT_MEM_CE" "$PADDR" 0
     sleep 1
 done
 sleep 2

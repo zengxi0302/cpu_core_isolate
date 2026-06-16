@@ -14,10 +14,12 @@
 set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
+parse_inject_args "$@"
 TC=$(( $(safe_cpu) + 1 ))
 [[ $TC -ge $(nproc) ]] && TC=$(( $(safe_cpu) - 1 ))
-status_banner "05 L3 Cache UCE accounting on cpu$TC (sw, status=$STAT_CACHE_UCE_L3)"
+status_banner "05 L3 Cache UCE accounting on cpu$TC (status=$STAT_CACHE_UCE_L3)"
 require_mce_inject
+hw_panic_warning
 
 # Park auto_isolate=0 only when cfi is loaded, restore at exit.
 RESTORE_AUTO=
@@ -31,7 +33,7 @@ UC0=$(cpu_attr "$TC" uce_count)
 ON0=$(cpu_online "$TC")
 dmesg_mark
 
-mce_submit sw 3 "$STAT_CACHE_UCE_L3" 0 0 "$TC"
+mce_inject_dispatch "$TC" 3 "$STAT_CACHE_UCE_L3" 0 0
 sleep 2
 
 UC1=$(cpu_attr "$TC" uce_count)

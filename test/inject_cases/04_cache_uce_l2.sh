@@ -18,16 +18,18 @@
 set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
+parse_inject_args "$@"
 TC=$(safe_cpu)
-status_banner "04 L2 Cache UCE on cpu$TC (sw, bank=3, status=$STAT_CACHE_UCE_L2)"
+status_banner "04 L2 Cache UCE on cpu$TC (bank=3, status=$STAT_CACHE_UCE_L2)"
 require_mce_inject
+hw_panic_warning
 
 ST0=$(cpu_attr "$TC" state)
 ON0=$(cpu_online "$TC")
 UC0=$(cpu_attr "$TC" uce_count)
 dmesg_mark
 
-mce_submit sw 3 "$STAT_CACHE_UCE_L2" 0 0 "$TC"
+mce_inject_dispatch "$TC" 3 "$STAT_CACHE_UCE_L2" 0 0
 sleep 3
 
 ST1=$(cpu_attr "$TC" state)

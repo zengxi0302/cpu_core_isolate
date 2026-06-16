@@ -14,9 +14,10 @@
 set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
+parse_inject_args "$@"
 TC=$(( $(safe_cpu) + 1 ))
 [[ $TC -ge $(nproc) ]] && TC=$(( $(safe_cpu) - 1 ))
-status_banner "06 L2 Cache CE on cpu$TC (sw, bank=3, status=$STAT_CACHE_CE_L2)"
+status_banner "06 L2 Cache CE on cpu$TC (bank=3, status=$STAT_CACHE_CE_L2)"
 require_mce_inject
 
 CE0=$(cpu_attr "$TC" ce_count)
@@ -24,7 +25,7 @@ ON0=$(cpu_online "$TC")
 dmesg_mark
 
 for i in 1 2; do
-    mce_submit sw 3 "$STAT_CACHE_CE_L2" 0 0 "$TC"
+    mce_inject_dispatch "$TC" 3 "$STAT_CACHE_CE_L2" 0 0
     sleep 1
 done
 sleep 1

@@ -89,6 +89,28 @@ diff -u /tmp/01_no_cfi.txt /tmp/01_with_cfi.txt
 
 每个脚本输出都包含同一段 `observations:` 区块，无 CFI 时 mfi 计数器显示 `(n/a — CFI not loaded)`，有 CFI 时显示真实增量。
 
+## `--hw` 与 `--sw`：同一个 case 切换注入路径
+
+01–08 默认走 sw 路径（debugfs flags=sw，纯 `mce_log` 解码链）。加 `--hw` 参数后会切到**真 #MC 路径**（自动选 `mce-inject(8)` 用户态 raise / debugfs flags=hw 中能用的那条），整组 fault matrix 都能在两种路径下重复实验：
+
+```bash
+# 默认 sw 路径（不进 do_machine_check）
+bash test/inject_cases/04_cache_uce_l2.sh
+
+# 真 #MC 路径（do_machine_check → mce_severity → decode chain）
+bash test/inject_cases/04_cache_uce_l2.sh --hw
+```
+
+输出 banner 会显示当前 `inject mode: sw/hw`。
+
+`--hw` 模式下首次注入会执行一次 hw 投递探测（mce-inject 用户态优先，回退 debugfs flags=hw），探测成功后才发起真实注入。探测失败会直接 abort，给出原因（WRMSR #GP / 两条路径都没投递 / 工具缺包）。
+
+**UC 类（02/03/04/05/07/08）+ `--hw` + 未加载 CFI = 几乎肯定 panic + kdump**（Intel 广播 MCE 同步超时），脚本会给 5 秒 Ctrl-C 窗口提醒确认 kdump 状态。CE 类（01/06）不带 UC 位，hw 模式下走 CMC handler，不会 panic。
+
+09 hwpoison_inject 走 `memory_failure` 直调，跟 MCE 通路无关，`--hw` 不适用，参数会被忽略。
+
+10–14 是"始终 hw"快捷形态（永远走真 #MC，无 `--sw` 选项），主要用来固化 panic-vs-isolate 演示与对外说法。功能上 `01–06 --hw` 与 10–14 等价；保留 10–14 是为了让"hw 路径"这条话术在脚本目录里一眼可见。
+
 ## hw 模式 case（10–14）跑之前
 
 cases 10–14 通过 `mce-inject(8)` 用户态工具触发真 #MC（工具内部把 debugfs `flags` 改为 `raise` 然后 WRMSR + IPI-NMI），不再依赖之前那个不可靠的"debugfs flags=hw 投递探测"。

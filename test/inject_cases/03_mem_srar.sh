@@ -16,8 +16,10 @@
 set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
-status_banner "03 Memory SRAR (sw, bank=4, status=$STAT_MEM_SRAR)"
+parse_inject_args "$@"
+status_banner "03 Memory SRAR (bank=4, status=$STAT_MEM_SRAR)"
 require_mce_inject
+hw_panic_warning
 
 US0=$(mfi_stat uce_sync)
 UA0=$(mfi_stat uce_async)
@@ -25,7 +27,7 @@ OFF0=$(mfi_stat pages_offlined)
 own_page mem_srar
 dmesg_mark
 
-mce_submit sw 4 "$STAT_MEM_SRAR" "$PADDR" 0 0
+mce_inject_dispatch 0 4 "$STAT_MEM_SRAR" "$PADDR" 0
 sleep 3
 
 US1=$(mfi_stat uce_sync)

@@ -15,10 +15,12 @@
 set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
+parse_inject_args "$@"
 TC=$(( $(safe_cpu) + 1 ))
 [[ $TC -ge $(nproc) ]] && TC=$(( $(safe_cpu) - 1 ))
-status_banner "07 TLB UCE on cpu$TC (sw, bank=2, status=$STAT_TLB_UCE)"
+status_banner "07 TLB UCE on cpu$TC (bank=2, status=$STAT_TLB_UCE)"
 require_mce_inject
+hw_panic_warning
 
 RESTORE_AUTO=
 if cfi_loaded; then
@@ -31,7 +33,7 @@ UC0=$(cpu_attr "$TC" uce_count)
 TY0=$(cpu_attr "$TC" error_types)
 dmesg_mark
 
-mce_submit sw 2 "$STAT_TLB_UCE" 0 0 "$TC"
+mce_inject_dispatch "$TC" 2 "$STAT_TLB_UCE" 0 0
 sleep 2
 
 UC1=$(cpu_attr "$TC" uce_count)

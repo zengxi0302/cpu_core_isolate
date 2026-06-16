@@ -14,15 +14,17 @@
 set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
-status_banner "02 Memory SRAO (sw, bank=4, status=$STAT_MEM_SRAO)"
+parse_inject_args "$@"
+status_banner "02 Memory SRAO (bank=4, status=$STAT_MEM_SRAO)"
 require_mce_inject
+hw_panic_warning
 
 UA0=$(mfi_stat uce_async)
 OFF0=$(mfi_stat pages_offlined)
 own_page mem_srao
 dmesg_mark
 
-mce_submit sw 4 "$STAT_MEM_SRAO" "$PADDR" 0 0
+mce_inject_dispatch 0 4 "$STAT_MEM_SRAO" "$PADDR" 0
 sleep 3
 
 UA1=$(mfi_stat uce_async)

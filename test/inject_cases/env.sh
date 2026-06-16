@@ -34,6 +34,120 @@ STAT_BUS_UCE=0xb000000000000e0f      # VAL|UC|EN | compound bus
 
 cfi_loaded() { lsmod | awk '{print $1}' | grep -qx cpu_fault_isolate; }
 
+# ============================================================
+# Injection mode: sw (default) or hw (real #MC via mce-inject(8) raise
+# or debugfs flags=hw). Per-case scripts call parse_inject_args "$@"
+# at startup; if --hw is on the command line, mce_inject_dispatch() will
+# route through hw_probe_once() -> mce_inject_hw() instead of mce_submit sw.
+# ============================================================
+INJECT_MODE=sw
+parse_inject_args() {
+    for a in "$@"; do
+        case "$a" in
+            --hw) INJECT_MODE=hw ;;
+            --sw) INJECT_MODE=sw ;;
+        esac
+    done
+}
+
+# Lazy probe of hw delivery. Picks the working path between userspace
+# mce-inject(8) (HCE2 physical) and debugfs flags=hw (cloud KVM).
+_HW_PROBE_DONE=0
+HW_METHOD=
+HW_AVAILABLE=0
+HW_PROBE_REASON=""
+_hw_probe_once() {
+    [[ $_HW_PROBE_DONE == 1 ]] && return
+    _HW_PROBE_DONE=1
+    require_mce_inject
+    # Use addr=0 (no own_page) so the probe is transparent to the case script.
+    # The probe is non-destructive to dmesg: we drop a unique marker and grep
+    # only the lines AFTER the marker.
+    local probe_cpu=$(safe_cpu) ce_bef ce_aft
+    local probe_mark="HW-PROBE-$$-$(date +%s%N)"
+    local _saw_log
+
+    _probe_saw_signal() {
+        local ce0=$1 ce1=$2
+        [[ "$ce1" != "(n/a)" && "${ce1:-0}" -gt "${ce0:-0}" ]] && return 0
+        dmesg | awk -v m="$probe_mark" 'p{print} $0~m{p=1}' | \
+            grep -qE 'mce: \[Hardware Error\]|Triggering MCE exception' && return 0
+        return 1
+    }
+
+    echo "$probe_mark" >/dev/kmsg 2>/dev/null
+    if command -v mce-inject >/dev/null 2>&1; then
+        ce_bef=$(mfi_stat ce_total)
+        mce_inject_file "$probe_cpu" 4 "$STAT_MEM_CE" 0 0 >/dev/null 2>&1 || true
+        sleep 2
+        ce_aft=$(mfi_stat ce_total)
+        if _probe_saw_signal "$ce_bef" "$ce_aft"; then
+            HW_METHOD=file
+            HW_AVAILABLE=1
+            return
+        fi
+    fi
+
+    echo "$probe_mark" >/dev/kmsg 2>/dev/null
+    ce_bef=$(mfi_stat ce_total)
+    mce_submit hw 4 "$STAT_MEM_CE" 0 0 "$probe_cpu" >/dev/null 2>&1 || true
+    sleep 2
+    ce_aft=$(mfi_stat ce_total)
+    if _probe_saw_signal "$ce_bef" "$ce_aft"; then
+        HW_METHOD=hw
+        HW_AVAILABLE=1
+        return
+    fi
+
+    HW_AVAILABLE=0
+    if dmesg | grep -qE 'unchecked MSR access error: WRMSR'; then
+        HW_PROBE_REASON="WRMSR to MCi_STATUS triggered #GP (vendor kernel / guest blocks MSR write)"
+    elif ! command -v mce-inject >/dev/null 2>&1; then
+        HW_PROBE_REASON="mce-inject(8) absent and debugfs flags=hw did not deliver"
+    else
+        HW_PROBE_REASON="neither mce-inject(8) tool nor debugfs flags=hw delivered #MC"
+    fi
+}
+
+# Real #MC injection (auto-selects userspace tool vs debugfs).
+# Usage: mce_inject_hw <cpu> <bank> <status> <addr> <misc>
+mce_inject_hw() {
+    local cpu=$1 bank=$2 status=$3 addr=${4:-0} misc=${5:-0}
+    _hw_probe_once
+    if [[ $HW_AVAILABLE == 0 ]]; then
+        echo "  [ABORT] hw mode requested but no working delivery path:"
+        echo "          $HW_PROBE_REASON"
+        return 1
+    fi
+    case "$HW_METHOD" in
+        file) mce_inject_file "$cpu" "$bank" "$status" "$addr" "$misc" ;;
+        hw|*) mce_submit hw "$bank" "$status" "$addr" "$misc" "$cpu" ;;
+    esac
+}
+
+# Dispatch sw or hw based on INJECT_MODE.
+# Usage: mce_inject_dispatch <cpu> <bank> <status> <addr> <misc>
+mce_inject_dispatch() {
+    if [[ "$INJECT_MODE" == hw ]]; then
+        mce_inject_hw "$@"
+    else
+        local cpu=$1 bank=$2 status=$3 addr=${4:-0} misc=${5:-0}
+        mce_submit sw "$bank" "$status" "$addr" "$misc" "$cpu"
+    fi
+}
+
+# Warn before injecting a UC event in hw mode without CFI loaded — that
+# combination is expected to panic on most kernels (broadcast MCE sync
+# timeout). UC cases should call this before mce_inject_dispatch.
+hw_panic_warning() {
+    [[ "$INJECT_MODE" == hw ]] || return 0
+    cfi_loaded && return 0
+    echo
+    echo "  !! --hw + CFI NOT LOADED — UC injection is expected to PANIC the host."
+    echo "  !! Confirm kdump configured and kernel.panic > 0. Ctrl-C within 5s to abort."
+    sleep 5
+}
+
 # Pick a safe target cpu: avoid cpu0 (housekeeping) and the last cpu.
 safe_cpu() {
     local n=$(nproc)
@@ -52,6 +166,7 @@ status_banner() {
     fi
     echo "  kernel     : $(uname -r)"
     echo "  case       : $1"
+    echo "  inject mode: $INJECT_MODE (override with --hw / --sw)"
     echo "  artifacts  : $LOGDIR/"
     echo "================================================================"
 }
