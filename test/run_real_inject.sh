@@ -94,13 +94,17 @@ fi
 [[ -x test/tools/ownpage ]] && ok "ownpage tool ready" || { bad "ownpage build failed"; exit 1; }
 [[ -x test/tools/cfimon ]] && ok "cfimon tool ready" || { bad "cfimon build failed"; exit 1; }
 
-# 装 mce-inject 工具与 mcelog (mcelog 观测，mce-inject 用户态工具仓库缺，用 debugfs 直写)
-dnf install -y mcelog >/dev/null 2>&1 || true
+# 装 mce-inject(8) 用户态工具 + mcelog 观测 + 加载内核模块
+# 用户态 mce-inject 是 C 段 hw 路径的关键依赖 (--with-hw 时); 走 dnf/zypper
+# 都试一下, 缺包 C 段会 SKIP 而不是失败.
+(dnf install -y mce-inject mcelog || zypper install -y mce-inject mcelog) >/dev/null 2>&1 || true
 modprobe mce_inject 2>&1 | tee -a "$REPORT"
 modprobe hwpoison_inject 2>&1 | tee -a "$REPORT"
 
 [[ -d "$INJ_DIR" ]] && ok "mce-inject debugfs available ($INJ_DIR)" \
                    || { bad "mce-inject debugfs missing"; exit 1; }
+command -v mce-inject >/dev/null 2>&1 && ok "mce-inject(8) userspace tool present" \
+                                      || skip "mce-inject(8) tool absent (C段 hw 路径会 SKIP)"
 [[ -f "$HWP_DIR/corrupt-pfn" ]] && ok "hwpoison-inject debugfs available" \
                                || skip "hwpoison-inject debugfs not present"
 
@@ -139,8 +143,12 @@ kill -0 $MONPID 2>/dev/null && ok "cfimon listener up" || bad "cfimon failed"
 
 dmesg -c >/dev/null 2>&1
 
-# ---------- 工具: 提交一次 mce-inject ----------
+# ---------- 工具: 提交一次 mce-inject (debugfs 路径) ----------
 # 用法: mce_inject <flags> <bank> <status_hex> <addr_hex> <misc_hex> <cpu>
+#
+# 注意: flags=sw 时只调 mce_log, 不进 do_machine_check; flags=hw 直注实测
+# 在 HCE2 物理机 (FMA firmware-first) 上不可靠 (probe 误诊). 走真 #MC 请
+# 用 mce_inject_file().
 mce_inject() {
     local flags=${1:-sw} bank=${2:-0} status=${3:-0} addr=${4:-0} misc=${5:-0} cpu=${6:-0}
     # 护栏: 绝不向离线 CPU 注入。inj_*_set 会用 smp_call_function_single
@@ -158,6 +166,38 @@ mce_inject() {
     echo "$flags"   > "$INJ_DIR/flags"
     # 最后写 bank 触发注入
     echo "$bank"    > "$INJ_DIR/bank"
+}
+
+# ---------- 工具: 真 #MC via mce-inject(8) 用户态工具 ----------
+# 用法: mce_inject_file <cpu> <bank> <status_hex> <addr_hex> <misc_hex>
+#
+# 走用户态工具 + .mce 文件. mce-inject(8) 会把 debugfs flags 改成 raise,
+# 然后 WRMSR + IPI-NMI 真正触发 #MC -> do_machine_check. HCE2 物理机
+# (Huawei 2288H V5 / FMA) 实测可靠; 直接 debugfs flags=hw 在该平台经常
+# 沉默无效, 因此 hw probe + C1-C5 都改走这条路径.
+mce_inject_file() {
+    local cpu=${1:-0} bank=${2:-0} status=${3:-0} addr=${4:-0} misc=${5:-0}
+    local onf="/sys/devices/system/cpu/cpu$cpu/online"
+    if [[ -f "$onf" && "$(cat "$onf")" == "0" ]]; then
+        log "  [GUARD] cpu$cpu is offline, skipping mce_inject_file"
+        return 1
+    fi
+    if ! command -v mce-inject >/dev/null 2>&1; then
+        log "  [GUARD] mce-inject(8) userspace tool missing (dnf install mce-inject)"
+        return 1
+    fi
+    local f=$LOGDIR/.mce.$$.txt
+    cat > "$f" <<MCE
+CPU $cpu
+BANK $bank
+STATUS $status
+ADDR $addr
+MISC $misc
+MCE
+    mce-inject "$f"
+    local rc=$?
+    rm -f "$f"
+    return $rc
 }
 
 # MCi_STATUS 位组装 (Intel SDM Vol 3 Ch 15)
@@ -415,46 +455,85 @@ else
     skip "hwpoison_inject not loaded"
 fi
 
-# ---------- C 可选: 真 #MC (hw mode) ----------
-# hw mode 与 sw 的区别 (mce-inject README):
-#   sw: 只调 x86_mce_decoder_chain，绕过 do_machine_check 主体
-#   hw: 真正经过 #MC exception handler -> do_machine_check -> __mc_scan_banks
-#       -> mce_severity -> 调度到 IRQ 上下文 -> decode chain
-# 安全约束: 全部 case 设 PCC=0；UC case 依赖我们的 panic_suppress (tolerant=3)
-# 来阻止 mce_panic。如果出问题 kdump 会保护，artifact 在 /home/cfi_logs/。
+# ---------- C 可选: 真 #MC ----------
+# 真 #MC 由 mce-inject(8) 用户态工具触发. 工具内部把 debugfs flags
+# 改成 raise, WRMSR + IPI-NMI 进 do_machine_check -> mce_severity ->
+# decode chain. 这条路在 HCE2 物理机 (FMA firmware-first) 与 KVM (带
+# MCE 虚拟化) 上都实测可工作.
+#
+# 早期版本走 debugfs flags=hw 直注 + CE 探测, 在 HCE2 物理机上给 false
+# negative (整段 SKIP). 物理机实测证伪: BIOS 并未屏蔽 WRMSR, 只是 CE
+# 走 CMC 那条 IRQ 路径不可靠, UC 走 NMI 那条完全通畅. 切到用户态工具
+# 之后即可在物理机上覆盖到 do_machine_check.
+#
+# 安全约束: PCC=0; UC case 依赖 cfi 模块的 panic_suppress (tolerant=3)
+# 抑制 mce_panic 广播同步超时. 极端情况下 kdump 兜底, artifact 在
+# /home/cfi_logs/.
 if [[ $WITH_HW == 1 ]]; then
     hdr "C hw-mode: real #MC exception handler path"
 
-    # ---- C0 KVM-guest hw-mode availability probe ----
-    # mce-inject 的 hw 模式经 prepare_msrs -> WRMSR MSR_IA32_MCi_STATUS -> raise
-    # #MC -> do_machine_check 读 MSR -> decode chain。KVM guest 上有 3 种可能:
-    #   (a) WRMSR 直接 #GP -> dmesg "unchecked MSR access error" + #MC 不发
-    #   (b) WRMSR 被 KVM 静默 no-op -> #MC 触发但 MSR 读回 0 -> decode chain 不调
-    #   (c) KVM 完整 MCE 虚拟化 -> #MC 流程通畅
-    # 单看 dmesg 区分不了 (b) 和 (c)，所以 probe 必须**实测 ce_total 是否累加**。
+    # ---- C0 hw 投递可用性探测 (双路径) ----
+    # 两条投递路径在不同环境上不等价:
+    #   - 物理机 HCE2 + Huawei 2288H V5 (FMA firmware-first):
+    #     mce-inject(8) 用户态工具 -> raise -> NMI -> do_machine_check (实测有)
+    #     直接 debugfs flags=hw -> CMC/IRQ 路径 (实测无 / vendor 拦)
+    #   - 云 VM (KVM nested w/ MCE virt):
+    #     debugfs flags=hw -> KVM 模拟 #MC (实测有)
+    #     mce-inject(8) 用户态工具 -> 没有走通 (尚未确证原因)
+    # 因此探测先试 userspace 工具, 不通就试 debugfs flags=hw; 把成功的方法
+    # 记到 INJECT_METHOD, C1-C5 沿用该方法注入.
+    HW_AVAILABLE=0
+    INJECT_METHOD=
+    HW_REASON=""
+
     dmesg -c >/dev/null 2>&1
     ./test/tools/ownpage > "$LOGDIR/inj_op_c0.txt" & C0PID=$!; sleep 1
     PFN_C0=$(awk -F= '/^pfn/{print $2}' "$LOGDIR/inj_op_c0.txt")
     [[ -z "$PFN_C0" ]] && PFN_C0=0x0
     PADDR_C0=$(printf "0x%x" $((PFN_C0 * 4096)))
-    PROBE_CPU=$(($(nproc) / 2))  # 避开 cpu0/最后一个 cpu
-    PROBE_CE_BEF=$(awk '/ce_total/{print $2}' $MEM/stats)
-    log "  probing hw-mode on cpu$PROBE_CPU (mem CE; ce_total baseline=$PROBE_CE_BEF)..."
-    mce_inject hw 4 "$STAT_MEM_CE" "$PADDR_C0" 0 "$PROBE_CPU"
-    sleep 3
-    PROBE_CE_AFT=$(awk '/ce_total/{print $2}' $MEM/stats)
+    PROBE_CPU=$(($(nproc) / 2))
+    [[ $PROBE_CPU -le 0 ]] && PROBE_CPU=1
+
+    try_probe() {
+        local method=$1
+        local before after
+        before=$(awk '/ce_total/{print $2}' $MEM/stats)
+        case $method in
+            file) mce_inject_file "$PROBE_CPU" 4 "$STAT_MEM_CE" "$PADDR_C0" 0 ;;
+            hw)   mce_inject hw 4 "$STAT_MEM_CE" "$PADDR_C0" 0 "$PROBE_CPU" ;;
+        esac
+        sleep 2
+        after=$(awk '/ce_total/{print $2}' $MEM/stats)
+        [[ $after -gt $before ]] && return 0
+        dmesg | tail -50 | grep -qE "mce: \[Hardware Error\]|Triggering MCE exception" && return 0
+        return 1
+    }
+
+    log "  probing hw delivery (mem CE on cpu$PROBE_CPU)..."
+    if command -v mce-inject >/dev/null 2>&1 && try_probe file; then
+        INJECT_METHOD=file
+        HW_AVAILABLE=1
+        log "    path: mce-inject(8) userspace tool (verified HCE2 physical)"
+    elif try_probe hw; then
+        INJECT_METHOD=hw
+        HW_AVAILABLE=1
+        log "    path: debugfs flags=hw (verified cloud KVM)"
+    elif dmesg | grep -qE "unchecked MSR access error: WRMSR"; then
+        HW_REASON="WRMSR to MCi_STATUS triggered #GP (vendor kernel / guest blocks MSR write)"
+    else
+        HW_REASON="no #MC delivered by either path (firmware-first BIOS / KVM without MCE virt)"
+    fi
+
     kill $C0PID 2>/dev/null
 
-    HW_REASON=""
-    if dmesg | grep -qE "unchecked MSR access error: WRMSR to 0x4"; then
-        HW_REASON="KVM guest #GP on WRMSR to MCi_STATUS"
-        HW_AVAILABLE=0
-    elif [[ $PROBE_CE_AFT -gt $PROBE_CE_BEF ]]; then
-        HW_AVAILABLE=1
-    else
-        HW_REASON="KVM guest silently no-ops WRMSR to MCi_STATUS (no decode chain delivery)"
-        HW_AVAILABLE=0
-    fi
+    # Wrapper: 用 INJECT_METHOD 选中的路径注入. 参数: <cpu> <bank> <status> <addr> <misc>
+    inject_real() {
+        local cpu=$1 bank=$2 status=$3 addr=${4:-0} misc=${5:-0}
+        case "$INJECT_METHOD" in
+            file) mce_inject_file "$cpu" "$bank" "$status" "$addr" "$misc" ;;
+            hw|*) mce_inject hw "$bank" "$status" "$addr" "$misc" "$cpu" ;;
+        esac
+    }
 
     if [[ $HW_AVAILABLE == 0 ]]; then
         skip "hw-mode unavailable: $HW_REASON"
@@ -463,12 +542,13 @@ if [[ $WITH_HW == 1 ]]; then
         skip "C3 hw mem SRAR (hw-mode unavailable)"
         skip "C4 hw cache UCE (hw-mode unavailable)"
         skip "C5 hw cache CE (hw-mode unavailable)"
-        log "  Why: hw-mode requires KVM with full MCE virtualization, or bare-metal."
-        log "       sw mode already covers x86_mce_decoder_chain end-to-end (see A1-A7),"
-        log "       so the remaining gap is mce_severity()/do_machine_check() prologue,"
-        log "       which can only be exercised on a physical CPU."
+        log "  Why: real #MC delivery needs either bare-metal w/ OS-first MCE +"
+        log "       mce-inject(8) tool, or KVM guest w/ full MCE virtualization."
+        log "       sw mode already covers x86_mce_decoder_chain end-to-end (A1-A7);"
+        log "       hwpoison_inject covers memory_failure full path (B);"
+        log "       only do_machine_check / mce_severity prologue stays unexercised."
     else
-        ok "hw-mode functional (ce_total moved $PROBE_CE_BEF -> $PROBE_CE_AFT)"
+        ok "hw delivery functional via $INJECT_METHOD"
     fi
 
 if [[ ${HW_AVAILABLE:-0} == 1 ]]; then
@@ -481,11 +561,10 @@ if [[ ${HW_AVAILABLE:-0} == 1 ]]; then
     PFN_C3=$(awk -F= '/^pfn/{print $2}' "$LOGDIR/inj_op_c3.txt")
     PADDR_C3=$(printf "0x%x" $((PFN_C3 * 4096)))
 
-    # ---- C1 hw memory CE: 经过 do_machine_check -> decode chain ----
+    # ---- C1 hw memory CE: do_machine_check -> CMC handler -> decode chain ----
     log "  --- C1 hw memory CE (PCC=0, expect: cfi mfi CE accounting) ---"
     CE_C0=$(awk '/ce_total/{print $2}' $MEM/stats)
-    PFN_C1=$(printf "0x%x" $((0xdeadbe))) # pad random; mfi pfn 校验不通过则 fall back
-    mce_inject hw 4 "$STAT_MEM_CE" "$PADDR_C2" 0 0
+    inject_real 0 4 "$STAT_MEM_CE" "$PADDR_C2" 0
     sleep 2
     CE_C1=$(awk '/ce_total/{print $2}' $MEM/stats)
     [[ $CE_C1 -gt $CE_C0 ]] && ok "hw mem CE flowed through real #MC handler (delta=$((CE_C1-CE_C0)))" \
@@ -495,7 +574,7 @@ if [[ ${HW_AVAILABLE:-0} == 1 ]]; then
     log "  --- C2 hw memory SRAO (UC+EN+MISCV+ADDRV, expect async UCE) ---"
     UA_C0=$(awk '/uce_async/{print $2}' $MEM/stats)
     OFF_C0=$(awk '/pages_offlined/{print $2}' $MEM/stats)
-    mce_inject hw 4 "$STAT_MEM_SRAO" "$PADDR_C2" 0 0
+    inject_real 0 4 "$STAT_MEM_SRAO" "$PADDR_C2" 0
     sleep 3
     UA_C1=$(awk '/uce_async/{print $2}' $MEM/stats)
     OFF_C1=$(awk '/pages_offlined/{print $2}' $MEM/stats)
@@ -506,9 +585,10 @@ if [[ ${HW_AVAILABLE:-0} == 1 ]]; then
     kill $C2 2>/dev/null
 
     # ---- C3 hw memory SRAR: 真 #MC -> mce_severity=AR -> sync memory_failure ----
+    # 无 CFI 时, broadcast MCE 同步超时会触发 mce_panic; CFI tolerant=3 门控掉.
     log "  --- C3 hw memory SRAR (UC+EN+MISCV+ADDRV+S+AR) ---"
     US_C0=$(awk '/uce_sync/{print $2}' $MEM/stats)
-    mce_inject hw 4 "$STAT_MEM_SRAR" "$PADDR_C3" 0 0
+    inject_real 0 4 "$STAT_MEM_SRAR" "$PADDR_C3" 0
     sleep 3
     US_C1=$(awk '/uce_sync/{print $2}' $MEM/stats)
     UA_C2=$(awk '/uce_async/{print $2}' $MEM/stats)
@@ -528,13 +608,16 @@ if [[ ${HW_AVAILABLE:-0} == 1 ]]; then
 
     # ---- C4 hw L2 Cache UCE: 真 #MC -> cpu 域隔离 ----
     # 用第三个 CPU (SAFE_TGT 已被 A4 隔离, SAFE_TGT2 被 A 段累计)。
+    # 这是 panic-vs-isolate 故事的真核心 case: 无 CFI 时 broadcast MCE
+    # 同步超时 -> mce_panic; 有 CFI 时 tolerant=3 门控 + 隔离接力. 详见
+    # docs/physical-host-panic-vs-isolation.md.
     echo 1 > /sys/kernel/cfi/auto_isolate 2>/dev/null  # C4 需要真隔离
     TCH=$(( SAFE_TGT2 + 1 )); [[ $TCH -ge $NCPU ]] && TCH=$(( SAFE_TGT - 1 ))
     log "  --- C4 hw L2 cache UCE on cpu$TCH (expect isolation) ---"
     UC_C0=$(cat /sys/devices/system/cpu/cpu$TCH/cfi/uce_count 2>/dev/null || echo 0)
     ST_C0=$(cat /sys/devices/system/cpu/cpu$TCH/cfi/state)
     log "    before: cpu$TCH state=$ST_C0 uce=$UC_C0"
-    mce_inject hw 3 "$STAT_CACHE_UCE_L2" 0 0 "$TCH"
+    inject_real "$TCH" 3 "$STAT_CACHE_UCE_L2" 0 0
     sleep 3
     UC_C1=$(cat /sys/devices/system/cpu/cpu$TCH/cfi/uce_count 2>/dev/null || echo 0)
     ST_C1=$(cat /sys/devices/system/cpu/cpu$TCH/cfi/state)
@@ -557,7 +640,7 @@ if [[ ${HW_AVAILABLE:-0} == 1 ]]; then
     log "  --- C5 hw L2 cache CE (corrected handler path) ---"
     TCC=$SAFE_TGT2
     CC_C0=$(cat /sys/devices/system/cpu/cpu$TCC/cfi/ce_count 2>/dev/null || echo 0)
-    mce_inject hw 3 "$STAT_CACHE_CE_L2" 0 0 "$TCC"
+    inject_real "$TCC" 3 "$STAT_CACHE_CE_L2" 0 0
     sleep 2
     CC_C1=$(cat /sys/devices/system/cpu/cpu$TCC/cfi/ce_count 2>/dev/null || echo 0)
     [[ $CC_C1 -gt $CC_C0 ]] && ok "hw cache CE counted (delta=$((CC_C1-CC_C0)))" \
