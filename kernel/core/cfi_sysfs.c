@@ -225,19 +225,34 @@ static const struct attribute_group cfi_global_attr_group = {
 
 /* ====== Init / Exit ====== */
 
+/*
+ * CPUs we actually attached the per-CPU 'cfi' sysfs group to. Exit must walk
+ * this mask, not for_each_possible_cpu — on hosts where a vendor module
+ * (e.g. livepatch_cpu_offline) holds some CPUs offline at insmod time, init's
+ * for_each_online_cpu skips them, and a possible-mask removal then triggers
+ * "sysfs group 'cfi' not found" WARN from sysfs_remove_group.
+ */
+static cpumask_var_t cfi_sysfs_attached;
+
 int cfi_sysfs_init(void)
 {
 	unsigned int cpu;
 	int ret;
 
+	if (!zalloc_cpumask_var(&cfi_sysfs_attached, GFP_KERNEL))
+		return -ENOMEM;
+
 	/* Create /sys/kernel/cfi/ */
 	cfi_kobj = kobject_create_and_add("cfi", kernel_kobj);
-	if (!cfi_kobj)
+	if (!cfi_kobj) {
+		free_cpumask_var(cfi_sysfs_attached);
 		return -ENOMEM;
+	}
 
 	ret = sysfs_create_group(cfi_kobj, &cfi_global_attr_group);
 	if (ret) {
 		kobject_put(cfi_kobj);
+		free_cpumask_var(cfi_sysfs_attached);
 		return ret;
 	}
 
@@ -252,6 +267,8 @@ int cfi_sysfs_init(void)
 		if (ret)
 			pr_warn("cpu%u: failed to create sysfs group: %d\n",
 				cpu, ret);
+		else
+			cpumask_set_cpu(cpu, cfi_sysfs_attached);
 	}
 	cpus_read_unlock();
 
@@ -268,7 +285,7 @@ void cfi_sysfs_exit(void)
 	unsigned int cpu;
 
 	cpus_read_lock();
-	for_each_possible_cpu(cpu) {
+	for_each_cpu(cpu, cfi_sysfs_attached) {
 		struct device *dev = get_cpu_device(cpu);
 
 		if (!dev)
@@ -276,6 +293,8 @@ void cfi_sysfs_exit(void)
 		sysfs_remove_group(&dev->kobj, &cfi_cpu_attr_group);
 	}
 	cpus_read_unlock();
+
+	free_cpumask_var(cfi_sysfs_attached);
 
 	if (cfi_kobj) {
 		sysfs_remove_group(cfi_kobj, &cfi_global_attr_group);
