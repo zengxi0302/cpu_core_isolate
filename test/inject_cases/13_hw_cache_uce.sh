@@ -1,27 +1,40 @@
 #!/bin/bash
-# Case 13 — Real #MC L2 Cache UCE (hw mode)  ★ CRASH-vs-ISOLATE demo ★
+# Case 13 — Real #MC L2 Cache UCE (mce-inject userspace tool)  ★ PANIC-vs-ISOLATE ★
 #
-#   path     : mce_inject hw  ->  do_machine_check -> mce_severity()
-#              -> non-memory UC error (no ADDRV/MISCV)
-#              -> severity = MCE_AR_SEVERITY or higher
-#   bank     : 3
-#   status   : 0xb00000000000000e  (VAL|UC|EN | L2)
+#   path     : mce-inject(8) -> raise -> do_machine_check -> mce_severity
+#              -> uncorrected cache error
+#   bank     : 1
+#   status   : 0xb80000000000000e  (VAL|UC|EN|MISCV | simple-cache L2 0x000E)
+#   target   : cpu picked by safe_cpu() (NCPU/2)
 #
-#   no  CFI  : kernel sees a UC machine check it cannot attribute to a
-#              specific page. With mce_tolerant<3 -> mce_panic.
-#              -> WHOLE MACHINE PANIC + KDUMP.
-#   has CFI  : MCE panic_notifier intercepts; cfi notifier sees cache UCE
-#              on cpuX; isolates cpuX (full/inactive/soft per module param);
-#              machine survives.
+#   no  CFI  : Intel MCE handler broadcasts; mce-inject only raises on one cpu.
+#              Other cpus -> "Some CPUs didn't answer in synchronization"
+#              -> mce_reign -> mce_panic -> Fatal machine check -> kdump.
+#              == VERIFIED kdump on HCE2 + 2288H V5 ==
+#              (vmcore-dmesg shows: mce_panic -> mce_reign -> mce_end
+#               -> do_machine_check -> raise_exception [mce_inject].)
+#   has CFI  : mce_tolerant=3 gates off the sync-timeout panic branch.
+#              do_machine_check returns cleanly. Decode chain delivers UC
+#              to cfi notifier; cfi classifies as cache UCE; cpu isolated
+#              per isolation_mode=:
+#                inactive (DEFAULT): set_cpu_active(cpuN, false), IRQs
+#                                    migrated, cpu stays online.
+#                                    Verified: ~462 IRQs migrated on the
+#                                    physical host; host stays up;
+#                                    taskset -c <cpuN> refuses bind.
+#                full              : real cpu_down. NEEDS the
+#                                    livepatch_percpu_counter hot-patch
+#                                    on HCE2 r2673_211_284 — otherwise
+#                                    cpu_dead callback hard-lockup at
+#                                    percpu_counter_cpu_dead+0x44.
 #
-#   prereq   : hw-mode delivery functional.
-#   warning  : without CFI this WILL panic the host; ensure kdump.
+#   WARNING  : without CFI this WILL panic the host.
 
 set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
 TC=$(safe_cpu)
-status_banner "13 hw L2 Cache UCE on cpu$TC (hw flag, bank=3, status=$STAT_CACHE_UCE_L2)"
+status_banner "13 hw L2 Cache UCE on cpu$TC (mce-inject userspace tool, bank=1)"
 require_mce_inject
 
 echo "  pre-state:"
@@ -29,7 +42,7 @@ echo "    /proc/sys/kernel/mce_tolerant = $(cat /proc/sys/kernel/mce_tolerant 2>
 echo "    /proc/sys/kernel/panic        = $(cat /proc/sys/kernel/panic 2>/dev/null || echo '?')"
 echo
 if ! cfi_loaded; then
-    echo "  !! CFI NOT LOADED — this injection may PANIC the host."
+    echo "  !! CFI NOT LOADED — this injection is expected to PANIC the host."
     echo "  !! Confirm kdump/auto-reboot is configured. Press Ctrl-C within 5s to abort."
     sleep 5
 fi
@@ -39,7 +52,7 @@ ST0=$(cpu_attr "$TC" state)
 ON0=$(cpu_online "$TC")
 dmesg_mark
 
-mce_submit hw 3 "$STAT_CACHE_UCE_L2" 0 0 "$TC"
+mce_inject_file "$TC" 1 0xb80000000000000e 0xdeadbeef000 0x0
 sleep 3
 
 UC1=$(cpu_attr "$TC" uce_count)
@@ -54,6 +67,19 @@ printf "    %-26s: %s -> %s\n" "cfi uce_count" "$UC0" "$UC1"
 echo "    dmesg (relevant):"
 dmesg_digest | sed 's/^/      /'
 
+# In inactive mode the cpu stays online; the scheduler-exclusion check is
+# the real "is this cpu actually isolated" signal — taskset must refuse.
+if cfi_loaded && [[ "$ST1" == "isolated" ]]; then
+    echo
+    echo "  scheduler-exclusion check (inactive mode signature):"
+    if taskset -c "$TC" true 2>/dev/null; then
+        echo "    [WARN] taskset -c $TC succeeded — cpu still in active_mask?"
+    else
+        echo "    [OK]   taskset -c $TC refused (cpu cleared from active_mask)"
+    fi
+fi
+
+# Full-mode safety: re-online if the cpu was actually hot-unplugged.
 if [[ "$ON1" == "0" && -w /sys/devices/system/cpu/cpu$TC/online ]]; then
     echo 1 > /sys/devices/system/cpu/cpu$TC/online 2>/dev/null
     sleep 1

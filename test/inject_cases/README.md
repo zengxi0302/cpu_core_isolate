@@ -2,15 +2,24 @@
 
 每个 `NN_<fault>.sh` 是一个独立可重复的故障注入实验，对应 `test/run_real_inject.sh` 里的一个分段。每个脚本在 CFI 模块加载与未加载两种状态下都能跑，输出固定格式，方便手动对比"无 CFI 时发生了什么"与"有 CFI 时发生了什么"。
 
-## 重要说明：sw 注入与 hw 注入的本质区别
+## 重要说明：三种注入路径
 
-`mce_inject` 的 `sw` flag 只把伪造的 MCi_STATUS 喂进 `x86_mce_decoder_chain`，**绕过** `do_machine_check` 与 `mce_severity`。无论 CFI 在不在场，**sw 注入都不会让内核 panic**，差别只是"有没有策略动作（隔离 / 软硬下线 / netlink）"。
+注入工具有两层 —— 内核 `mce_inject` 模块（debugfs `/sys/kernel/debug/mce-inject/`）与用户态 `mce-inject(8)` 工具，它们对路径的影响**不一样**：
 
-`hw` flag 才真发 `#MC` 异常，走完 `do_machine_check → mce_severity → CMC/MCE handler`。这才是触发 panic 的路径——`mce_tolerant<3` 时遇到 AR/PCC=1 类严重事件，内核就 `mce_panic`。"无 CFI 整机宕机 vs 有 CFI 隔离"的对照实验**只在 hw 模式下成立**。
+| 路径 | 触发方式 | 走 do_machine_check？ | 真发 #MC？ | 用在哪些 case |
+|------|---------|----------------------|-----------|--------------|
+| `flags=sw` + debugfs 写 bank | `echo sw > flags; echo $bank > bank` | 否 | 否，只 `mce_log()` | 01–08 |
+| `mce-inject(8)` + `.mce` 文件 | `mce-inject xxx.mce` —— 工具内部强制 `flags=raise`，WRMSR + IPI-NMI | **是** | **是** | 10–14 |
+| `hwpoison_inject` | `echo $pfn > /sys/.../corrupt-pfn` —— 直接调内核 `memory_failure()` | 不相关（不走 MCE chain） | 否 | 09 |
 
-`hwpoison_inject` 走 `memory_failure` 内核态全路径，跟 CFI 在不在场无关都会下线页，差别只在 CFI 的记账与 netlink。
+**关键坑点**：用户态 `mce-inject` 工具会**强制覆写** `/sys/kernel/debug/mce-inject/flags` 为 `raise`，所以你在 cat flags 看到 `sw` 不代表注入瞬间走的是 sw 路径。Cases 10–14 改用了 `mce_inject_file` 助手（直接调用 `mce-inject` 工具），把这层显式化掉，不再依赖 debugfs `flags=hw` 的状态。
 
-`hw` 模式在部分 HCE2 物理机内核 / KVM guest 上被屏蔽（WRMSR MCi_STATUS 被静默 no-op 或 #GP），脚本会自检并提前退出。
+**对 panic 抑制 demo 的影响**：
+
+- sw 注入（01–08）：无论 CFI 在不在，都**不会 panic**，差别只是"有没有策略动作"。
+- hw 路径（10–14）+ UC bits：广播 MCE 默认开启，`mce-inject` 工具只在单 CPU 上 raise；其它 CPU 来不及响应 → `mce_panic` 触发"Some CPUs didn't answer in synchronization"。**这就是无 CFI 整机宕机的真实成因**。CFI 通过把 `mce_tolerant` 抬到 3，门控掉这条 panic 分支，让 do_machine_check 干净返回，再由 decode chain 进入 cfi notifier 隔离 cpu。
+
+**已在 HCE2 + 2288H V5 物理机实证**：cases 12 与 13 的 .mce 注入，无 CFI 时触发 `mce_panic + kdump`，加载 CFI（inactive 模式）后同样注入只导致目标 cpu 被 inactive-isolated，整机存活。详见 `docs/physical-host-panic-vs-isolation.md`。
 
 ## 对照矩阵
 
@@ -25,25 +34,28 @@
 | 07 | `07_tlb_uce.sh` | TLB UCE（compound 0x0816） | sw chain | 2 | `0xb000…0816` | EDAC 记录 | uce_count++ 归类为 TLB |
 | 08 | `08_bus_uce.sh` | Bus UCE（compound 0x0E0F） | sw chain | 5 | `0xb000…0e0f` | EDAC 记录 | uce_count++ 归类为 BUS（部分总线错误非 per-cpu，可能 SKIP） |
 | 09 | `09_hwpoison_inject.sh` | 直发 memory_failure | hwpoison debugfs | – | – | 内核 memory_failure 下线页 | 同上 + mfi 记账 + netlink |
-| 10 | `10_hw_mem_ce.sh` | 真 #MC 内存 CE | hw 异常 | 4 | `0x9c00…0094` | 真 #MC corrected handler 记录 | 同上 + cfi 通知器记账 |
-| 11 | `11_hw_mem_srao.sh` | 真 #MC SRAO | hw 异常 | 4 | `0xbc00…0094` | mce_severity=AO，异步 memory_failure | 同上 + cfi 记账 + netlink |
-| 12 | `12_hw_mem_srar.sh` | 真 #MC SRAR | hw 异常 | 4 | `0xbd80…0094` | **`tolerant<3` 时 mce_panic → 整机宕机 + kdump** | cfi 把 tolerant 升到 3 + panic_notifier 拦截 → 同步 memory_failure，owner SIGBUS，整机存活 |
-| 13 | `13_hw_cache_uce.sh` | 真 #MC L2 cache UCE | hw 异常 | 3 | `0xb000…000e` | **mce_panic → 整机宕机 + kdump** | cfi panic_notifier 拦截 + 按 mode 隔离 cpu，整机存活 |
-| 14 | `14_hw_cache_ce.sh` | 真 #MC L2 cache CE | hw 异常 | 3 | `0x9000…000e` | CMC handler 记录 | cfi cache CE 累加 |
+| 10 | `10_hw_mem_ce.sh` | 真 #MC 内存 CE | mce-inject(8) | 4 | `0x9c00…0094` | 真 #MC corrected handler 记录 | 同上 + cfi 通知器记账 |
+| 11 | `11_hw_mem_srao.sh` | 真 #MC SRAO | mce-inject(8) | 4 | `0xbc00…0094` | mce_severity=AO，异步 memory_failure | 同上 + cfi 记账 + netlink |
+| 12 | `12_hw_mem_srar.sh` | 真 #MC SRAR | mce-inject(8) | 4 | `0xbd80…0094` | **mce_panic + kdump** (sync timeout) | tolerant=3 门控 panic + decode chain → sync memory_failure，owner SIGBUS，整机存活 |
+| 13 | `13_hw_cache_uce.sh` | 真 #MC L2 cache UCE | mce-inject(8) | 1 | `0xb800…000e` | **mce_panic + kdump**（已在物理机实证）| tolerant=3 门控 panic + cfi 按 mode 隔离 cpu，整机存活 |
+| 14 | `14_hw_cache_ce.sh` | 真 #MC L2 cache CE | mce-inject(8) | 1 | `0x9000…000e` | CMC handler 记录 | cfi cache CE 累加 |
 
-**真正能演示"宕机 vs 存活"的只有 12 和 13。** 其它 11 个 case 都是"无策略动作 vs 有策略动作"——可以用来证明 CFI 工作正常，但不能证明 CFI 救了整机。
+**真正能演示"宕机 vs 存活"的是 12 和 13**（已在 HCE2 + 2288H V5 物理机实证）。其它 case 演示的是"无策略动作 vs 有策略动作"——可以证明 CFI 分类与隔离链路工作，但不演示救机能力。
 
 ## 前置准备
 
 ```bash
-# 0. 确保 mce_inject 与 hwpoison_inject 内核模块已加载
+# 0. 确保内核模块已加载
 modprobe mce_inject
 modprobe hwpoison_inject
 
-# 1. 编译用户态工具（ownpage / cfimon）
+# 1. 安装 mce-inject 用户态工具（cases 10–14 强依赖）
+dnf install -y mce-inject || zypper install -y mce-inject
+
+# 2. 编译仓库内的用户态工具（ownpage / cfimon）
 make -C test/tools
 
-# 2.（可选）启动 cfimon 抓 netlink，供 09 之外的 case 验证
+# 3.（可选）启动 cfimon 抓 netlink，供 09 之外的 case 验证
 ./test/tools/cfimon > /home/cfi_logs/inject_cases/cfimon.log &
 ```
 
@@ -79,16 +91,24 @@ diff -u /tmp/01_no_cfi.txt /tmp/01_with_cfi.txt
 
 ## hw 模式 case（10–14）跑之前
 
-先用 case 10 探一下 hw 投递是否可用。它会自检 WRMSR 是否被屏蔽，不可用就直接退出，不会发起真注入。如果 case 10 直接 abort，case 11–14 都跑不了 hw 路径——这是 vendor kernel / KVM 的限制，不是 CFI 的问题。可考虑：
-- 真正裸金属 + 未屏蔽的 BIOS/MCE 配置；
-- ACPI EINJ（参考 `test/inject/inject_common.sh` 的 EINJ 分支）；
-- 真坏 DIMM。
+cases 10–14 通过 `mce-inject(8)` 用户态工具触发真 #MC（工具内部把 debugfs `flags` 改为 `raise` 然后 WRMSR + IPI-NMI），不再依赖之前那个不可靠的"debugfs flags=hw 投递探测"。
+
+12 / 13 在**无 CFI** 时**必然**触发 panic + kdump（不是"如果 tolerant<3"才会，而是 Intel 广播 MCE 同步超时这条独立路径，与严重性档位无关）。跑之前确认：
+
+```bash
+# kdump 已启用 & 配置了 dump 路径
+systemctl status kdump
+
+# /proc/sys/kernel/panic > 0，否则 panic 后机器不会自动 reboot
+sysctl kernel.panic
+```
 
 ## 安全栏
 
-- `mce_submit` 拒绝向已离线的 cpu 注入（`smp_call_function_single` 会卡死）；
-- 04/13 case 隔离 CPU 后会自动尝试 `echo 1 > .../online` 把它拉回；
+- `mce_submit` 与 `mce_inject_file` 都拒绝向已离线的 cpu 注入（`smp_call_function_single` 会卡死）；
+- 04/13 case 隔离 CPU 后会自动尝试 `echo 1 > .../online` 把它拉回（full 模式才会有变化，inactive 模式 cpu 本就在线）；
 - 12/13 case 在 CFI 未加载时会给 5 秒 Ctrl-C 窗口，确认 kdump 状态后再继续。
+- full 模式在 HCE2 `r2673_211_284` 及更老物理机上会触发 `percpu_counter_cpu_dead` 硬死锁；需要先打 `livepatch_percpu_counter` 热补丁才能用。inactive 是 HCE2 物理机的推荐默认。
 
 ## 这套对外能讲什么
 

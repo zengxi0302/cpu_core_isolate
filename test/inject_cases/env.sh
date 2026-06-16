@@ -69,9 +69,21 @@ require_hwpoison_inject() {
     fi
     [[ -f $HWP_DIR/corrupt-pfn ]] || { echo "[ABORT] $HWP_DIR/corrupt-pfn missing"; exit 1; }
 }
+require_mce_inject_userspace() {
+    command -v mce-inject >/dev/null 2>&1 || {
+        echo "[ABORT] userspace tool 'mce-inject' missing (try: dnf install mce-inject)"
+        exit 1
+    }
+}
 
-# Submit one mce-inject event.
+# Submit one mce-inject event via the debugfs interface.
+# Use this for the *sw* path (flags=sw); decode chain only, no #MC.
+#
 # Usage: mce_submit <flags=sw|hw> <bank> <status_hex> <addr_hex> <misc_hex> <cpu>
+#
+# CAVEAT: do not rely on flags=hw here for a "real #MC" demo on physical hosts.
+# Empirically on HCE2 + Purley (Huawei 2288H V5) the userspace mce-inject(8)
+# tool is more reliable for hw-equivalent delivery — see mce_inject_file().
 mce_submit() {
     local flags=$1 bank=$2 status=$3 addr=${4:-0} misc=${5:-0} cpu=${6:-0}
     local onf=/sys/devices/system/cpu/cpu$cpu/online
@@ -86,7 +98,38 @@ mce_submit() {
     echo "$cpu"    > $INJ_DIR/cpu
     echo "$flags"  > $INJ_DIR/flags
     echo "$bank"   > $INJ_DIR/bank
-    echo "  injected: flags=$flags bank=$bank status=$status addr=$addr cpu=$cpu"
+    echo "  injected (debugfs): flags=$flags bank=$bank status=$status addr=$addr cpu=$cpu"
+}
+
+# Submit a real #MC via the mce-inject(8) userspace tool with a .mce file.
+# This is the path verified to actually deliver #MC on HCE2 physical hosts:
+# the tool internally writes flags="raise" to /sys/kernel/debug/mce-inject
+# before triggering, so the debugfs flags node's static value (sw|hw) does
+# NOT govern the actual injection mechanism.
+#
+# Usage: mce_inject_file <cpu> <bank> <status_hex> [addr_hex] [misc_hex]
+mce_inject_file() {
+    local cpu=$1 bank=$2 status=$3 addr=${4:-0x0} misc=${5:-0x0}
+    local onf=/sys/devices/system/cpu/cpu$cpu/online
+    if [[ -f $onf && "$(cat $onf)" == "0" ]]; then
+        echo "[ABORT] cpu$cpu offline; mce_inject_file would deadlock"
+        return 1
+    fi
+    require_mce_inject_userspace
+    local f=$LOGDIR/.mce.$$.txt
+    cat > "$f" <<MCE
+CPU $cpu
+BANK $bank
+STATUS $status
+ADDR $addr
+MISC $misc
+MCE
+    echo "  injecting (mce-inject userspace tool, raise mode):"
+    sed 's/^/    /' "$f"
+    mce-inject "$f"
+    local rc=$?
+    rm -f "$f"
+    return $rc
 }
 
 # Run the ownpage helper in the background. Sets PFN_OWNER_PID, PFN, PADDR.

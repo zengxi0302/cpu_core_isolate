@@ -1,31 +1,28 @@
 #!/bin/bash
-# Case 14 — Real #MC L2 Cache CE (hw mode)
+# Case 14 — Real #MC L2 Cache CE (mce-inject userspace tool)
 #
-#   path     : mce_inject hw  ->  do_machine_check (CMC/corrected handler)
-#              -> mce_severity = MCE_NO_SEVERITY
-#              -> x86_mce_decoder_chain
-#   bank     : 3
-#   status   : 0x900000000000000e  (VAL|EN | L2)
+#   path     : mce-inject(8) -> raise -> do_machine_check
+#              -> mce_severity = MCE_NO_SEVERITY -> x86_mce_decoder_chain
+#   bank     : 1
+#   status   : 0x900000000000000e  (VAL|EN | L2 simple-cache)
 #
-#   no  CFI  : kernel CMC handler logs; no panic; no isolation.
+#   no  CFI  : CMC corrected handler logs; no panic; no isolation.
 #   has CFI  : cfi ce_count++ on the originating cpu; CE alone never
 #              isolates (matches case 06 for the real-#MC path).
-#
-#   prereq   : hw-mode delivery functional.
 
 set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
 TC=$(( $(safe_cpu) + 1 ))
 [[ $TC -ge $(nproc) ]] && TC=$(( $(safe_cpu) - 1 ))
-status_banner "14 hw L2 Cache CE on cpu$TC (hw flag, bank=3, status=$STAT_CACHE_CE_L2)"
+status_banner "14 hw L2 Cache CE on cpu$TC (mce-inject userspace tool, bank=1)"
 require_mce_inject
 
 CE0=$(cpu_attr "$TC" ce_count)
 ON0=$(cpu_online "$TC")
 dmesg_mark
 
-mce_submit hw 3 "$STAT_CACHE_CE_L2" 0 0 "$TC"
+mce_inject_file "$TC" 1 "$STAT_CACHE_CE_L2" 0x0 0x0
 sleep 2
 
 CE1=$(cpu_attr "$TC" ce_count)
