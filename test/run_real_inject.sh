@@ -198,7 +198,8 @@ SAFE_TGT2=$(( SAFE_TGT + 1 ))
 # 稳健重新上线: 先试原生 sysfs; 物理机上 cpu_subsys_online 也可能被打桩,
 # 那时只能靠模块 unisolate 的 bypass (此处尽力而为, 失败仅告警不致命)。
 reonline_cpu() {
-    local cpu=$1 onf="/sys/devices/system/cpu/cpu$cpu/online"
+    local cpu=$1
+    local onf="/sys/devices/system/cpu/cpu$cpu/online"
     [[ -f "$onf" ]] || return 0
     [[ "$(cat "$onf")" == "1" ]] && return 0
     echo 1 > "$onf" 2>/dev/null
@@ -576,8 +577,12 @@ dmesg | grep -E "MCE.*Hardware Error|memory_failure|Memory failure|cpu_fault_iso
 hdr "Cleanup"
 kill $MONPID 2>/dev/null
 echo 1 > /sys/kernel/cfi/auto_isolate 2>/dev/null
-# re-online 任何 offline CPU (稳健路径)
+# re-online 任何 offline CPU (跳过已在线的; 物理机上 vendor 模块如
+# livepatch_cpu_offline 会保持部分 CPU 在线状态不可写, 反复 echo 1 也无意义)
 for c in $(seq 0 $(($(nproc)-1))); do
+    onf=/sys/devices/system/cpu/cpu$c/online
+    [[ -f "$onf" ]] || continue
+    [[ "$(cat "$onf")" == "0" ]] || continue
     reonline_cpu $c
 done
 sleep 1
