@@ -269,8 +269,13 @@ CFI 的覆盖矩阵：
 | 场景 | 内核默认（无 CFI）| CFI 加载后 | 机制 |
 |------|-------------------|------------|------|
 | 广播 MCE sync 超时（mce-inject 单核 raise） | `mce_panic("Fatal machine check")` | **不 panic**，事件经 decode chain 处理 | `mce_tolerant=3` 门控 sync 超时分支 |
-| 非 AR 严重性事件（SRAO / cache UCE / TLB UCE / Bus UCE） | 各自的轻量处理或忽略 | CFI notifier 接管，分类、隔离、netlink | decode chain 注册 |
+| 内存 CE / SRAO（pfn 可识别）| 内核 memory_failure 处理或忽略 | CFI 软/硬下线 page；机器活 | mfi page handler + memory_failure |
+| L1 / L2 cache UCE（per-core）| 各自轻处理或忽略 | CFI notifier **隔离上报 CPU** | decode chain；cache 本地，单核隔离对 |
+| TLB / Bus UCE（per-core）| 各自轻处理或忽略 | CFI notifier **隔离上报 CPU** | 同上 |
+| L3 / LLC cache UCE（socket 共享）| 各自轻处理或忽略 | CFI **仅记账 + netlink**（默认）；**不**隔离 CPU | `isolate_on_l3_uce=0` 默认；L3 共享，隔离单核不解决根因 |
 | 内核态 AR 严重性事件（如 `--lmce` + SRAR） | `mce_panic("Fatal local machine check")` | **同样 panic**，CFI panic_notifier 只能 logging | 内核无条件路径，tolerant 无能为力 |
+
+**Cache 层级策略说明**：CFI 按物理 cache 拓扑分流隔离决策。Intel Skylake-SP / Cascade Lake-SP（你这台 2288H V5）+ AMD Zen 都是同一拓扑——L1（per-core，分 L1I 指令 + L1D 数据）+ L2（per-core，统一）+ L3（socket-shared，Intel 是 CHA tile 分布式，AMD 是 CCX-shared）。L1/L2 坏的话只影响那一个物理核，隔离它正确；L3 坏的话所有核共享同一片 LLC slice，隔离上报核**不解决根因**，需要在 userspace daemon 层做地址级 hwpoison 或者 socket-level drain。所以 CFI 模块参数 `isolate_on_l3_uce` 默认 **0**——L3 UCE 走"记账 + netlink，CPU 留在线让 daemon 决策"路径。要恢复早期"L3 UCE 一律隔离上报核"行为：`echo 1 > /sys/kernel/cfi/isolate_on_l3_uce`。
 
 **汇报时这一条建议主动讲**：CFI 的卖点不是"消灭所有 panic"，而是"消灭那些原本不该 panic 的 panic（mce-inject 工艺、广播误判等不必要的整机宕机），让真正不可恢复的故障走 kdump 兜底，可控地保留现场。"
 

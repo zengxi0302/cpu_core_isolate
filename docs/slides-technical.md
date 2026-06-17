@@ -15,7 +15,7 @@
 ```
 
 **触发场景**：
-- L1/L2/L3 Cache 不可纠正错误（UCE）
+- L1/L2 Cache 不可纠正错误（UCE，per-core 隔离）；L3 / LLC UCE 默认记账，由 daemon 决策（socket-shared）
 - TLB / Bus / 微架构内部错误
 - 内存控制器报告的 DRAM UCE
 
@@ -197,7 +197,8 @@ cpu_fault_isolate.ko (单一模块，~3000 行 C)
 | sysfs 读写 / debugfs 注入 | HCE2 VM | ✅ PASS |
 | MCE decode chain 真实路径 (sw inject) | HCE2 VM + 物理机 | ✅ PASS |
 | 内存 CE/SRAO/SRAR | HCE2 VM + 物理机 | ✅ PASS |
-| Cache UCE L2/L3 + TLB + Bus | HCE2 VM + 物理机 | ✅ PASS |
+| Cache UCE L1 / L2 + TLB + Bus（per-core）| HCE2 VM + 物理机 | ✅ PASS，隔离上报 CPU |
+| Cache UCE L3 / LLC（socket 共享）| HCE2 VM + 物理机 | ✅ PASS，默认仅记账 + netlink（`isolate_on_l3_uce=0`）|
 | hwpoison_inject 内核全路径 | HCE2 VM + 物理机 | ✅ PASS |
 | **inactive 模式（cpu_active_mask 清除）** | **HCE2 物理机** | **✅ PASS** |
 | **物理机 EDAC DIMM 真实解码** | **HCE2 物理机 / Skylake** | **✅ 验证** |

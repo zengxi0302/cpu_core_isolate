@@ -98,6 +98,7 @@ extern unsigned int cfi_mce_tolerant;
 extern bool cfi_offline_bypass;
 extern bool cfi_protect_cpu0;
 extern bool cfi_soft_isolation;	/* deprecated alias for isolation_mode=soft */
+extern bool cfi_isolate_on_l3_uce;
 
 /*
  * Isolation mechanism. Selected by the isolation_mode= modparam at load.

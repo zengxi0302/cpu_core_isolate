@@ -23,28 +23,32 @@
 
 ## 模式适用速查表
 
-| # | Case | 默认 sw | `--hw` | `--lmce` | 备注 |
-|---|------|--------|--------|---------|------|
-| 01 | mem CE | ✅ | ❌ | ❌ | CE 走 CMC IRQ，HCE2 FMA 拦 |
-| 02 | mem SRAO | ✅ | ✅ | ❌ | LMCE 路径要求 S/AR 位 |
-| 03 | **mem SRAR** | ✅ | ✅ | ⭐ **panic demo** | **`--lmce` 唯一真实用例**（S+AR）|
-| 04 | cache UCE L2 | ✅ | ✅ | ❌ | 无 S/AR |
-| 05 | cache UCE L3 | ✅ | ✅ | ❌ | 无 S/AR |
-| 06 | cache CE | ✅ | ❌ | ❌ | CE 走 CMC，FMA 拦 |
-| 07 | TLB UCE | ✅ | ✅ | ❌ | 无 S/AR |
-| 08 | Bus UCE | ✅ | ✅ | ❌ | 无 S/AR |
-| 09 | hwpoison | ✅ | (sw) | (sw) | 不走 MCE 链路，参数被忽略 |
-| 10 | hw mem CE | – | ❌ | ❌ | 同 case 01 hw 路径 |
-| 11 | hw mem SRAO | – | ✅ | ❌ | 同 case 02 |
-| 12 | **hw mem SRAR** | – | ✅ | ⭐ **panic demo** | 同 case 03，"始终 hw"入口 |
-| 13 | hw cache UCE | – | ✅ | ❌ | 同 case 04 |
-| 14 | hw cache CE | – | ❌ | ❌ | 同 case 06 |
+| # | Case | 默认 sw | `--hw` | `--lmce` | 隔离行为（CFI 加载，inactive 模式） | 备注 |
+|---|------|--------|--------|---------|--------------------------------|------|
+| 01 | mem CE | ✅ | ❌ | ❌ | 阈值后软下线 page | CE 走 CMC IRQ，HCE2 FMA 拦 |
+| 02 | mem SRAO | ✅ | ✅ | ❌ | 硬下线 page，cpu 不动 | LMCE 路径要求 S/AR 位 |
+| 03 | **mem SRAR** | ✅ | ✅ | ⭐ **panic demo** | 硬下线 page + SIGBUS owner | **`--lmce` 唯一真实用例**（S+AR）|
+| 04 | cache UCE L2 | ✅ | ✅ | ❌ | **隔离 cpu**（L2 per-core）| L2 是 per-core，单核隔离正确 |
+| 05 | cache UCE L3 | ✅ | ✅ | ❌ | **不隔离 cpu**（L3 socket 共享，默认 `isolate_on_l3_uce=0`）| 仅记账 + netlink；可 sysfs 切换 |
+| 06 | cache CE L2 | ✅ | ❌ | ❌ | 仅记账 | CE 走 CMC，FMA 拦 |
+| 07 | TLB UCE | ✅ | ✅ | ❌ | 仅记账（脚本 force `auto_isolate=0`，只验证分类）| TLB 物理上 per-core，去 hack 后可隔离 |
+| 08 | Bus UCE | ✅ | ✅ | ❌ | 仅记账（同上）| Bus 错误归属可能模糊，默认不真隔离 |
+| 09 | hwpoison | ✅ | (sw) | (sw) | 硬下线 page | 不走 MCE 链路 |
+| 10 | hw mem CE | – | ❌ | ❌ | 同 01 | 同 case 01 hw 路径 |
+| 11 | hw mem SRAO | – | ✅ | ❌ | 同 02 | 同 case 02 |
+| 12 | **hw mem SRAR** | – | ✅ | ⭐ **panic demo** | 同 03 | 同 case 03，"始终 hw"入口 |
+| 13 | hw cache UCE L2 | – | ✅ | ❌ | **隔离 cpu** | 同 case 04 |
+| 14 | hw cache CE L2 | – | ❌ | ❌ | 仅记账 | 同 case 06 |
+| 15 | **L1D Cache UCE** | ✅ | ✅ | ❌ | **隔离 cpu**（L1 per-core）| 新增；L1 simple-code，分类成 L1D |
+| 16 | **L1I Cache UCE** | ✅ | ✅ | ❌ | **隔离 cpu**（L1 per-core）| 新增；compound 0x0801 (TT=Instr, LL=L1) |
+| 17 | L1 Cache CE | ✅ | ❌ | ❌ | 仅记账 | 新增；CE 阈值前不隔离 |
 
 图例：✅ 工作；❌ 该平台不投递；⭐ 强烈推荐用于 demo。
 
-**两条平台限制（HCE2 + 2288H V5 实测）**：
-1. **CE 经 hw raise 不投递**（cases 01/06/10/14 的 `--hw`）—— CE 走 CMC IRQ，HCE2 FMA 在这条 polling 路径上拦截、scrub MCi_STATUS。**用默认 sw 注入做 CE 测试**。
+**三条平台限制 / 设计决策**：
+1. **CE 经 hw raise 不投递**（cases 01/06/10/14/17 的 `--hw`）—— CE 走 CMC IRQ，HCE2 FMA 在这条 polling 路径上拦截、scrub MCi_STATUS。**用默认 sw 注入做 CE 测试**。
 2. **`--lmce` 仅对自带 S/AR 位的注入有效**（即 case 03 / 12 SRAR）—— LMCE 路径要求 AR severity 才完整走 do_machine_check。**用 `--lmce` 做 panic demo 时选 03 或 12**。
+3. **L3 cache UCE 默认不隔离 cpu**（case 05）—— L3 是 socket 共享（Intel CHA tile / AMD CCX-shared），隔离单核不解决根因。默认 `isolate_on_l3_uce=0`，仅记账 + netlink 让 daemon 决定。要恢复"激进保守"行为：`echo 1 > /sys/kernel/cfi/isolate_on_l3_uce`。L1/L2 cache 是 per-core，单核隔离仍正确，行为不变。
 
 ## 对照矩阵
 

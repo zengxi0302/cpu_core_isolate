@@ -99,8 +99,18 @@ static u32 cfi_x86_classify_errcode(u16 errcode)
 		if (errcode & 0x0010)
 			return CFI_ERR_TLB;
 
-		/* Bus/interconnect errors */
-		if (errcode & 0x0800)
+		/*
+		 * Bus / interconnect errors. Intel compound bus codes carry
+		 * the cache-hierarchy class field bits[10:8] = 0b111 (or 0b110
+		 * for legacy variants), so the class nibble is 0xE/0xF. Plain
+		 * cache compound codes have class = 0b000, so their class nibble
+		 * is 0x8 (just the compound flag in bit 11). The previous test
+		 * "errcode & 0x0800" matched the compound flag itself and
+		 * mis-classified all cache compound codes (e.g. L1I 0x0801)
+		 * as BUS. Match the class nibble explicitly.
+		 */
+		if ((errcode & 0x0F00) == 0x0E00 ||
+		    (errcode & 0x0F00) == 0x0F00)
 			return CFI_ERR_BUS;
 
 		/* Cache-related compound errors */

@@ -201,6 +201,7 @@ CFI_GLOBAL_ATTR_RW(ce_threshold, cfi_ce_threshold);
 CFI_GLOBAL_ATTR_RW(uce_threshold, cfi_uce_threshold);
 CFI_GLOBAL_ATTR_RW(window_secs, cfi_window_secs);
 CFI_GLOBAL_ATTR_BOOL_RW(auto_isolate, cfi_auto_isolate);
+CFI_GLOBAL_ATTR_BOOL_RW(isolate_on_l3_uce, cfi_isolate_on_l3_uce);
 
 static ssize_t version_g_show(struct kobject *kobj,
 			      struct kobj_attribute *attr, char *buf)
@@ -215,6 +216,7 @@ static struct attribute *cfi_global_attrs[] = {
 	&cfi_attr_uce_threshold.attr,
 	&cfi_attr_window_secs.attr,
 	&cfi_attr_auto_isolate.attr,
+	&cfi_attr_isolate_on_l3_uce.attr,
 	&cfi_attr_version.attr,
 	NULL,
 };

@@ -158,6 +158,24 @@ void cfi_report_error(struct cfi_error_event *event)
 		goto out;
 	}
 
+	/*
+	 * L3 / LLC is socket-shared (CHA tiles on Intel, CCX on AMD): isolating
+	 * the reporting CPU doesn't remove the dependency on the bad cache slice,
+	 * so by default we account the UCE and emit a netlink event but skip the
+	 * automatic CPU isolation. A userspace daemon can do address-level
+	 * handling (hwpoison affected pages) or escalate to socket-level drain.
+	 * Set isolate_on_l3_uce=1 to fall back to the conservative behavior.
+	 * L1 / L2 are per-core, so any non-L3 cache UCE keeps the original
+	 * "isolate reporting CPU" path.
+	 */
+	if (event->error_type == CFI_ERR_CACHE_L3 && !cfi_isolate_on_l3_uce &&
+	    (ci->state == CFI_STATE_ONLINE || ci->state == CFI_STATE_DEGRADED) &&
+	    ci->uce_count >= cfi_uce_threshold) {
+		pr_info_ratelimited("cpu%u: L3 cache UCE not isolating (shared LLC; set isolate_on_l3_uce=1 to override)\n",
+				    cpu);
+		goto out;
+	}
+
 	switch (ci->state) {
 	case CFI_STATE_ONLINE:
 		if (ci->uce_count >= cfi_uce_threshold) {

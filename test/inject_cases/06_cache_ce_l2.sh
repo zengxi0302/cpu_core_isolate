@@ -15,8 +15,7 @@ set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
 parse_inject_args "$@"
-TC=$(( $(safe_cpu) + 1 ))
-[[ $TC -ge $(nproc) ]] && TC=$(( $(safe_cpu) - 1 ))
+TC=$(safe_cpu_alt)
 status_banner "06 L2 Cache CE on cpu$TC (bank=3, status=$STAT_CACHE_CE_L2)"
 require_mce_inject
 

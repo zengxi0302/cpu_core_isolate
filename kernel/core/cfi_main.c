@@ -72,6 +72,20 @@ MODULE_PARM_DESC(protect_cpu0,
 	"kernels, the housekeeping CPU that runs the hotplug teardown "
 	"(work_on_cpu); offlining it mid-teardown deadlocks (default: Y)");
 
+bool cfi_isolate_on_l3_uce = false;
+module_param_named(isolate_on_l3_uce, cfi_isolate_on_l3_uce, bool, 0644);
+MODULE_PARM_DESC(isolate_on_l3_uce,
+	"Whether a Last-Level (L3 / LLC) cache UCE should trigger CPU "
+	"isolation. L3 is socket-shared (CHA tiles on Intel, CCX on AMD), so "
+	"isolating the reporting CPU does not remove the dependency on the "
+	"bad LLC slice — other CPUs sharing the same L3 can still hit the "
+	"same corrupted line. Default N: account the UCE and emit netlink "
+	"event so a userspace daemon can decide (hwpoison affected pages, "
+	"alert for socket drain, etc.); CPU stays online. Set Y to fall back "
+	"to the conservative \"isolate the reporting CPU anyway\" behavior, "
+	"which matches earlier releases. L1/L2 UCE always isolates (those "
+	"caches are per-core; isolating the core is the right answer).");
+
 bool cfi_soft_isolation = false;
 module_param_named(soft_isolation, cfi_soft_isolation, bool, 0644);
 MODULE_PARM_DESC(soft_isolation,

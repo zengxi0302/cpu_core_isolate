@@ -260,6 +260,18 @@ SAFE_TGT=$(( NCPU / 2 ))
 # cfi_report_error 会跳过已隔离 CPU)。
 SAFE_TGT2=$(( SAFE_TGT + 1 ))
 [[ $SAFE_TGT2 -ge $NCPU ]] && SAFE_TGT2=$(( SAFE_TGT - 1 ))
+# Avoid landing on cpu0 (housekeeping; can't be offlined; protect_cpu0 refuses
+# isolation). On very small VMs the +1/-1 dance can collapse to cpu0.
+[[ $SAFE_TGT2 -le 0 ]] && SAFE_TGT2=1
+[[ $SAFE_TGT2 -eq $SAFE_TGT && $NCPU -gt 2 ]] && SAFE_TGT2=$(( SAFE_TGT + 2 ))
+
+# A4b-A7 need a CPU distinct from SAFE_TGT (which A4 will have isolated).
+# On NCPU <= 2 there's no usable second CPU (cpu0 protected, only cpu1 left
+# and that's SAFE_TGT). Set a flag so those sub-cases SKIP cleanly.
+HAS_ALT_CPU=1
+if [[ $NCPU -le 2 ]] || [[ $SAFE_TGT2 -eq $SAFE_TGT ]]; then
+    HAS_ALT_CPU=0
+fi
 
 # 稳健重新上线: 先试原生 sysfs; 物理机上 cpu_subsys_online 也可能被打桩,
 # 那时只能靠模块 unisolate 的 bypass (此处尽力而为, 失败仅告警不致命)。
@@ -401,7 +413,17 @@ sleep 1
 # 以下 A4b-A7 仅验证「真 MCE decode chain -> 各类错误分类记账」,
 # 关闭 auto_isolate, 用另一个干净 CPU (SAFE_TGT 已被 A4 隔离, 会被跳过)。
 echo 0 > /sys/kernel/cfi/auto_isolate 2>/dev/null
-log "  (A4b-A7: auto_isolate=0, accounting-only, target cpu$SAFE_TGT2)"
+if [[ $HAS_ALT_CPU == 0 ]]; then
+    log "  (A4b-A7: SKIP — NCPU=$NCPU 太少, 没有可用的 SAFE_TGT2 != $SAFE_TGT 且 != cpu0)"
+    skip "A4b L3 Cache UCE (no usable alt CPU on NCPU=$NCPU)"
+    skip "A5 L2 Cache CE  (no usable alt CPU on NCPU=$NCPU)"
+    skip "A6 TLB UCE      (no usable alt CPU on NCPU=$NCPU)"
+    skip "A7 Bus UCE      (no usable alt CPU on NCPU=$NCPU)"
+else
+    log "  (A4b-A7: auto_isolate=0, accounting-only, target cpu$SAFE_TGT2)"
+fi
+
+if [[ $HAS_ALT_CPU == 1 ]]; then
 
 # ---------- A4b L3/generic Cache UCE (simple errcode 0x000F) ----------
 hdr "A4b L3 Cache UCE accounting"
@@ -459,6 +481,7 @@ else
     skip "Bus UCE not visible (path-specific; not all bus errors per-CPU)"
 fi
 echo 1 > /sys/kernel/cfi/auto_isolate 2>/dev/null  # 恢复 auto_isolate
+fi  # HAS_ALT_CPU == 1 (A4b-A7 sub-block)
 
 # ---------- B hwpoison_inject 路径 ----------
 hdr "B hwpoison_inject (kernel-direct memory_failure full path)"

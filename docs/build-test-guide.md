@@ -545,22 +545,31 @@ EOF
 sudo mce-inject /tmp/l1d_cache_ce.mce
 ```
 
-#### 5.3.4 注入 L3 Cache UCE (触发隔离)
+#### 5.3.4 注入 L3 Cache UCE (默认仅记账，不隔离)
 
 ```bash
 cat > /tmp/l3_cache_uce.mce << 'EOF'
 # L3 Cache Uncorrected Error on CPU 4
 # MCA error code 0x000F = L3/generic cache
 # UC bit set = uncorrected
+# 在 Intel Skylake-SP/Cascade Lake-SP 上 L3 错误来自 CHA bank (9+);
+# bank 3 = MLC (L2) 与 L3 errcode 语义不一致, hw 路径会被拒。
 CPU 4
-BANK 3
+BANK 9
 STATUS Val UC EN MiscV AddrV 0x000F
 ADDR 0xdeadbeef000
 MISC 0x0
 EOF
 
-# ⚠️ 这会触发 CPU 4 的隔离！确保 CPU 4 不是唯一的 CPU
+# L3 是 socket 共享缓存。默认 isolate_on_l3_uce=0 时, CFI 仅记账并
+# 发 netlink, **不隔离 CPU** (隔离单核解决不了共享 LLC 的问题, 应由
+# userspace daemon 做 hwpoison / socket-level drain)。
 sudo mce-inject /tmp/l3_cache_uce.mce
+
+# 要恢复早期"L3 UCE 一律隔离上报核"的行为:
+echo 1 > /sys/kernel/cfi/isolate_on_l3_uce
+sudo mce-inject /tmp/l3_cache_uce.mce
+echo 0 > /sys/kernel/cfi/isolate_on_l3_uce
 ```
 
 #### 5.3.5 批量注入触发阈值

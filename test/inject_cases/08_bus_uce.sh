@@ -16,8 +16,7 @@ set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
 parse_inject_args "$@"
-TC=$(( $(safe_cpu) + 1 ))
-[[ $TC -ge $(nproc) ]] && TC=$(( $(safe_cpu) - 1 ))
+TC=$(safe_cpu_alt)
 status_banner "08 Bus UCE on cpu$TC (bank=5, status=$STAT_BUS_UCE)"
 require_mce_inject
 hw_panic_warning

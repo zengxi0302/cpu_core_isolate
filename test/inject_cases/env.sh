@@ -26,9 +26,12 @@ mkdir -p "$LOGDIR"
 STAT_MEM_CE=0x9c00000000000094       # VAL|EN|MISCV|ADDRV
 STAT_MEM_SRAO=0xbc00000000000094     # +UC
 STAT_MEM_SRAR=0xbd80000000000094     # +UC|S|AR
-STAT_CACHE_UCE_L2=0xb00000000000000e # VAL|UC|EN | L2
-STAT_CACHE_UCE_L3=0xb00000000000000f # VAL|UC|EN | L3/generic
-STAT_CACHE_CE_L2=0x900000000000000e  # VAL|EN | L2
+STAT_CACHE_UCE_L1=0xb00000000000000d  # VAL|UC|EN | simple-cache 0x000D = L1 (classified L1D)
+STAT_CACHE_UCE_L1I=0xb000000000000801 # VAL|UC|EN | compound (bit 11) + LL=L1 + TT=Instr -> L1I
+STAT_CACHE_UCE_L2=0xb00000000000000e  # VAL|UC|EN | L2
+STAT_CACHE_UCE_L3=0xb00000000000000f  # VAL|UC|EN | L3/generic
+STAT_CACHE_CE_L1=0x900000000000000d   # VAL|EN    | L1
+STAT_CACHE_CE_L2=0x900000000000000e   # VAL|EN    | L2
 STAT_TLB_UCE=0xb000000000000816      # VAL|UC|EN | compound TLB
 STAT_BUS_UCE=0xb000000000000e0f      # VAL|UC|EN | compound bus
 
@@ -127,6 +130,20 @@ hw_panic_warning() {
 safe_cpu() {
     local n=$(nproc)
     local t=$(( n / 2 ))
+    [[ $t -le 0 ]] && t=1
+    echo $t
+}
+
+# Pick a second safe target cpu (distinct from safe_cpu(), still != 0).
+# Used by cases that account/inject on a different cpu than case 04/13/15
+# isolates, so the two don't step on each other.
+safe_cpu_alt() {
+    local s=$(safe_cpu)
+    local n=$(nproc)
+    local t=$(( s + 1 ))
+    if [[ $t -ge $n ]]; then
+        t=$(( s - 1 ))
+    fi
     [[ $t -le 0 ]] && t=1
     echo $t
 }

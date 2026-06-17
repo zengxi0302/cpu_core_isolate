@@ -13,11 +13,13 @@
 
 公有云计算节点（宿主机）运行大量虚拟机（VM），当 CPU 出现以下硬件故障时：
 
-| 故障类型 | 内核默认行为 | 影响 |
-|---------|------------|------|
-| Cache UCE（L1/L2/L3 不可纠正错误） | `mce_panic()` → 整机宕机 | **所有 VM 全部丢失** |
-| TLB / Bus / Internal UCE | `mce_panic()` → 整机宕机 | **所有 VM 全部丢失** |
-| 内存 UCE 被内核态消费 | `mce_panic()` → 整机宕机 | **所有 VM 全部丢失** |
+| 故障类型 | 内核默认行为 | CFI 加载后处置 | 影响 |
+|---------|------------|----------------|------|
+| Cache UCE L1 / L2（per-core）| `mce_panic()` → 整机宕机 | tolerant=3 拦 panic + **隔离上报 CPU**（L1/L2 per-core，单核隔离对）| 只丢绑定在故障 CPU 上的 VM |
+| Cache UCE L3 / LLC（socket 共享）| `mce_panic()` → 整机宕机 | tolerant=3 拦 panic + **仅记账 + netlink**（默认 `isolate_on_l3_uce=0`）；userspace daemon 决策 | L3 共享，隔离单核不解决根因，需要 page-level hwpoison 或 socket drain |
+| TLB / Bus / Internal UCE（per-core）| `mce_panic()` → 整机宕机 | tolerant=3 拦 panic + 隔离上报 CPU | 只丢绑定在故障 CPU 上的 VM |
+| 内存 UCE 被用户态消费 | `mce_panic()` → 整机宕机（tolerant<3 时）| tolerant=3 + memory_failure → SIGBUS 用户进程 + page 硬下线 | 只丢踩到坏 page 的 VM |
+| 内存 UCE 被内核态消费 | `mce_panic()` → 整机宕机 | **同样 panic**（kernel-mode AR severity 无可恢复路径）| 内核无可恢复路径，CFI 也救不了 |
 
 **核心矛盾**：单个 CPU 核心故障 → 牵连整机 100+ 个核心上的所有 VM。
 

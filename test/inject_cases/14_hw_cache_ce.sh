@@ -22,8 +22,7 @@ cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
 parse_inject_args "$@"
 INJECT_MODE=hw
-TC=$(( $(safe_cpu) + 1 ))
-[[ $TC -ge $(nproc) ]] && TC=$(( $(safe_cpu) - 1 ))
+TC=$(safe_cpu_alt)
 status_banner "14 hw L2 Cache CE on cpu$TC (mce-inject userspace tool, bank=1)"
 require_mce_inject
 
