@@ -35,17 +35,34 @@ STAT_BUS_UCE=0xb000000000000e0f      # VAL|UC|EN | compound bus
 cfi_loaded() { lsmod | awk '{print $1}' | grep -qx cpu_fault_isolate; }
 
 # ============================================================
-# Injection mode: sw (default) or hw (real #MC via mce-inject(8) raise
-# or debugfs flags=hw). Per-case scripts call parse_inject_args "$@"
-# at startup; if --hw is on the command line, mce_inject_dispatch() will
-# route through hw_probe_once() -> mce_inject_hw() instead of mce_submit sw.
+# Injection mode + options. Per-case scripts call parse_inject_args "$@"
+# at startup.
+#
+#   --sw          decode chain only (default; never panics)
+#   --hw          real #MC via mce-inject(8) raise / debugfs flags=hw
+#   --lmce        implies --hw; sets MCGSTATUS=0xF (MCIP|EIPV|RIPV|LMCE_S).
+#                 Skips the Intel broadcast MCE sync; the kernel processes
+#                 the event locally and panics (or recovers) based on
+#                 mce_severity, matching real hardware-fault semantics.
+#                 Without --lmce, hw injection only raises on one cpu and
+#                 mce_reign times out -> mce_panic("Some CPUs didn't answer
+#                 in synchronization") which is an mce-inject artifact, not
+#                 a real-hardware panic mechanism. With --lmce, panic
+#                 (when no CFI) reads "Fatal machine check on current CPU",
+#                 the canonical severity-driven message.
+#   --mcgstatus=X explicit MCGSTATUS hex (advanced).
 # ============================================================
 INJECT_MODE=sw
+INJECT_LMCE=0
+_INJECT_MCGSTATUS=""   # empty = kernel default; nonzero = override
+
 parse_inject_args() {
     for a in "$@"; do
         case "$a" in
-            --hw) INJECT_MODE=hw ;;
-            --sw) INJECT_MODE=sw ;;
+            --hw)            INJECT_MODE=hw ;;
+            --sw)            INJECT_MODE=sw ;;
+            --lmce)          INJECT_MODE=hw; INJECT_LMCE=1; _INJECT_MCGSTATUS=0xf ;;
+            --mcgstatus=*)   _INJECT_MCGSTATUS="${a#--mcgstatus=}" ;;
         esac
     done
 }
@@ -85,13 +102,23 @@ mce_inject_dispatch() {
 }
 
 # Warn before injecting a UC event in hw mode without CFI loaded — that
-# combination is expected to panic on most kernels (broadcast MCE sync
-# timeout). UC cases should call this before mce_inject_dispatch.
+# combination is expected to panic on most kernels:
+#   - default hw (no LMCE): broadcast MCE sync timeout -> "Some CPUs didn't
+#     answer in synchronization" -> mce_panic (mce-inject single-CPU raise
+#     artifact, not a real-hardware failure mode)
+#   - --lmce: kernel handles locally, mce_severity drives the decision;
+#     AR / PCC=1 with mce_tolerant<3 -> mce_panic("Fatal machine check on
+#     current CPU") — this matches the actual real-hardware panic path
+# UC cases should call this before mce_inject_dispatch.
 hw_panic_warning() {
     [[ "$INJECT_MODE" == hw ]] || return 0
     cfi_loaded && return 0
     echo
-    echo "  !! --hw + CFI NOT LOADED — UC injection is expected to PANIC the host."
+    if [[ $INJECT_LMCE == 1 ]]; then
+        echo "  !! --lmce + CFI NOT LOADED — severity-driven mce_panic expected."
+    else
+        echo "  !! --hw + CFI NOT LOADED — broadcast-sync-timeout mce_panic expected."
+    fi
     echo "  !! Confirm kdump configured and kernel.panic > 0. Ctrl-C within 5s to abort."
     sleep 5
 }
@@ -114,7 +141,12 @@ status_banner() {
     fi
     echo "  kernel     : $(uname -r)"
     echo "  case       : $1"
-    echo "  inject mode: $INJECT_MODE (override with --hw / --sw)"
+    echo "  inject mode: $INJECT_MODE (override with --hw / --sw / --lmce)"
+    if [[ $INJECT_LMCE == 1 ]]; then
+        echo "  lmce       : ON  (MCGSTATUS=$_INJECT_MCGSTATUS — local MCE, no broadcast sync)"
+    elif [[ -n "$_INJECT_MCGSTATUS" ]]; then
+        echo "  mcgstatus  : $_INJECT_MCGSTATUS (explicit override)"
+    fi
     echo "  artifacts  : $LOGDIR/"
     echo "================================================================"
 }
@@ -159,9 +191,16 @@ mce_submit() {
     echo "$misc"   > $INJ_DIR/misc
     echo 0         > $INJ_DIR/synd
     echo "$cpu"    > $INJ_DIR/cpu
+    # MCGSTATUS override (for --lmce or explicit --mcgstatus). Only meaningful
+    # for the hw path (sw path bypasses do_machine_check entirely).
+    if [[ "$flags" == "hw" && -n "${_INJECT_MCGSTATUS:-}" && -w $INJ_DIR/mcgstatus ]]; then
+        echo "$_INJECT_MCGSTATUS" > $INJ_DIR/mcgstatus
+    fi
     echo "$flags"  > $INJ_DIR/flags
     echo "$bank"   > $INJ_DIR/bank
-    echo "  injected (debugfs): flags=$flags bank=$bank status=$status addr=$addr cpu=$cpu"
+    local mcgs_note=""
+    [[ "$flags" == "hw" && -n "${_INJECT_MCGSTATUS:-}" ]] && mcgs_note=" mcgstatus=$_INJECT_MCGSTATUS"
+    echo "  injected (debugfs): flags=$flags bank=$bank status=$status addr=$addr cpu=$cpu$mcgs_note"
 }
 
 # Submit a real #MC via the mce-inject(8) userspace tool with a .mce file.
@@ -187,6 +226,11 @@ STATUS $status
 ADDR $addr
 MISC $misc
 MCE
+    # Inline MCGSTATUS line if --lmce or --mcgstatus is set. The mce-inject(8)
+    # tool parses this and writes it to debugfs/mcgstatus before triggering.
+    if [[ -n "${_INJECT_MCGSTATUS:-}" ]]; then
+        echo "MCGSTATUS $_INJECT_MCGSTATUS" >> "$f"
+    fi
     echo "  injecting (mce-inject userspace tool, raise mode):"
     sed 's/^/    /' "$f"
     mce-inject "$f"

@@ -89,7 +89,7 @@ diff -u /tmp/01_no_cfi.txt /tmp/01_with_cfi.txt
 
 每个脚本输出都包含同一段 `observations:` 区块，无 CFI 时 mfi 计数器显示 `(n/a — CFI not loaded)`，有 CFI 时显示真实增量。
 
-## `--hw` 与 `--sw`：同一个 case 切换注入路径
+## `--hw` / `--sw` / `--lmce`：同一个 case 切换注入路径
 
 01–08 默认走 sw 路径（debugfs flags=sw，纯 `mce_log` 解码链）。加 `--hw` 参数后会切到**真 #MC 路径**（自动选 `mce-inject(8)` 用户态 raise / debugfs flags=hw 中能用的那条），整组 fault matrix 都能在两种路径下重复实验：
 
@@ -106,6 +106,25 @@ bash test/inject_cases/04_cache_uce_l2.sh --hw
 `--hw` 模式下首次注入会执行一次 hw 投递探测（mce-inject 用户态优先，回退 debugfs flags=hw），探测成功后才发起真实注入。探测失败会直接 abort，给出原因（WRMSR #GP / 两条路径都没投递 / 工具缺包）。
 
 **UC 类（02/03/04/05/07/08）+ `--hw` + 未加载 CFI = 几乎肯定 panic + kdump**（Intel 广播 MCE 同步超时），脚本会给 5 秒 Ctrl-C 窗口提醒确认 kdump 状态。CE 类（01/06）不带 UC 位，hw 模式下走 CMC handler，不会 panic。
+
+### `--lmce`：更接近真实硬件的注入语义
+
+默认 `--hw` 的 panic 路径是 **mce-inject 的工艺**——它只在单 CPU 上 raise，其它核来不及响应，`mce_reign` 同步超时 → `mce_panic("Some CPUs didn't answer in synchronization")`。真实硬件 MCA 微码会广播给所有核，sync 必过，**真正的 panic 是 `mce_severity` 决策（AR/PCC=1 + tolerant<3）触发的**。
+
+`--lmce` 把 `MCGSTATUS` 拉到 `0xF`（`MCIP|EIPV|RIPV|LMCE_S`），告诉内核这是一个**局部 MCE**，不走广播同步。这样 panic 走 `mce_severity` 那条决策路径，dmesg 里看到的就是 `Fatal machine check on current CPU` —— 真实硬件的标准信息，对外汇报"无 CFI = 真实硬件故障下整机宕机"更有说服力。
+
+```bash
+# 物理机上验证 LMCE-style 真实路径
+bash test/inject_cases/04_cache_uce_l2.sh --lmce        # implies --hw
+# 等价于:
+bash test/inject_cases/04_cache_uce_l2.sh --hw --mcgstatus=0xf
+```
+
+需要 CPU 支持 LMCE（Skylake+ 服务器型号都支持）。`--lmce` 在加载 CFI 后跑会触发 inactive 隔离（与默认 --hw 一样的隔离效果）；在没有 CFI 时会以 severity-driven 路径触发 panic（即真实硬件意义上的 mce_panic）。
+
+`--mcgstatus=X` 暴露出来给做实验时手动改各 bit，例如：
+- `0xE` = `MCIP|EIPV|LMCE_S`（去掉 RIPV，PCC=1 的非可恢复场景）
+- `0x7` = `MCIP|EIPV|RIPV`（不加 LMCE，仍走广播路径，方便对照）
 
 09 hwpoison_inject 走 `memory_failure` 直调，跟 MCE 通路无关，`--hw` 不适用，参数会被忽略。
 

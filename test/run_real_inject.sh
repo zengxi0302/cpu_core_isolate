@@ -36,14 +36,22 @@ MEM=/sys/kernel/cfi/mem
 
 PASS=0; FAIL=0; SKIP=0
 WITH_HW=0
+WITH_LMCE=0
+_INJECT_MCGSTATUS=""
 # 默认隔离模式: inactive
 #   - VM/裸金属上工作良好(也可以选 full 走完整 cpu_down)
 #   - 物理机上避开 HCE2 完整 cpu_down 的 ABBA 死锁
 # 显式覆盖: --mode=full|inactive|soft 或 --offline (= full) / --soft
+# --lmce: implies --hw; 把 C1-C5 的 MCGSTATUS 拉成 0xF (含 LMCE_S),
+#         绕过 Intel 广播 MCE 同步, 改走 mce_severity 决策路径. 这是更接近
+#         真实硬件 panic 的语义 ("Fatal machine check on current CPU"
+#         而不是 "Some CPUs didn't answer in synchronization").
 MODE=inactive
 for a in "$@"; do
     case "$a" in
         --hw)             WITH_HW=1 ;;
+        --lmce)           WITH_HW=1; WITH_LMCE=1; _INJECT_MCGSTATUS=0xf ;;
+        --mcgstatus=*)    _INJECT_MCGSTATUS="${a#--mcgstatus=}" ;;
         --offline|--full) MODE=full ;;
         --soft)           MODE=soft ;;
         --inactive)       MODE=inactive ;;
@@ -77,7 +85,7 @@ dmesg_since_mark_grep() {
 : > "$DMESGLOG"
 log "CFI/MFI real-path validation  $(date)"
 log "host: $(uname -r)  cpus=$(nproc)  mem=$(free -h | awk '/Mem/{print $2}')"
-log "options: WITH_HW=$WITH_HW"
+log "options: WITH_HW=$WITH_HW WITH_LMCE=$WITH_LMCE${_INJECT_MCGSTATUS:+ MCGSTATUS=$_INJECT_MCGSTATUS}"
 log "artifacts: $LOGDIR/  (persistent disk, survives reboot)"
 
 # ---------- 前置 ----------
@@ -163,6 +171,10 @@ mce_inject() {
     echo "$misc"    > "$INJ_DIR/misc"
     echo 0          > "$INJ_DIR/synd"
     echo "$cpu"     > "$INJ_DIR/cpu"
+    # MCGSTATUS override (for --lmce / --mcgstatus). hw flag only.
+    if [[ "$flags" == "hw" && -n "${_INJECT_MCGSTATUS:-}" && -w "$INJ_DIR/mcgstatus" ]]; then
+        echo "$_INJECT_MCGSTATUS" > "$INJ_DIR/mcgstatus"
+    fi
     echo "$flags"   > "$INJ_DIR/flags"
     # 最后写 bank 触发注入
     echo "$bank"    > "$INJ_DIR/bank"
@@ -194,6 +206,9 @@ STATUS $status
 ADDR $addr
 MISC $misc
 MCE
+    if [[ -n "${_INJECT_MCGSTATUS:-}" ]]; then
+        echo "MCGSTATUS $_INJECT_MCGSTATUS" >> "$f"
+    fi
     mce-inject "$f"
     local rc=$?
     rm -f "$f"
