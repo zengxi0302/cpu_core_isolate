@@ -217,8 +217,110 @@ sysctl kernel.panic
 - 12/13 case 在 CFI 未加载时会给 5 秒 Ctrl-C 窗口，确认 kdump 状态后再继续。
 - full 模式在 HCE2 `r2673_211_284` 及更老物理机上会触发 `percpu_counter_cpu_dead` 硬死锁；需要先打 `livepatch_percpu_counter` 热补丁才能用。inactive 是 HCE2 物理机的推荐默认。
 
+## APEI EINJ 注入路径 (Cases 20–28)
+
+Cases 20–28 使用 ACPI APEI EINJ (Error INJection) 接口注入硬件错误，完全绕开 mce-inject 工具。EINJ 通过固件层面注入，走平台原生的错误处理路径（GHES/APEI），**不存在 mce-inject 的广播 MCE 同步超时问题**。
+
+### EINJ vs mce-inject 对比
+
+| 维度 | mce-inject (Cases 01–17) | APEI EINJ (Cases 20–28) |
+|------|--------------------------|-------------------------|
+| 注入层 | 内核态 debugfs / 用户态 WRMSR | 固件层 ACPI EINJ action table |
+| 错误投递 | 单 CPU raise，其它 CPU 不知道 | 固件广播，所有 CPU 正确同步 |
+| 无 CFI panic 原因 | "Some CPUs didn't answer in synchronization"（sync 超时工艺） | "Fatal machine check on current CPU"（真实严重性驱动） |
+| FMA/SMM 干扰 | CE 走 CMC IRQ 被 scrub（HCE2 实测） | 固件原生路径，不受 CMC polling 干扰 |
+| 地址定向 | MCi_ADDR 直写 | param1=物理地址, param2=mask |
+| CPU 定向 | MCi bank 指定 CPU | param3=APIC ID |
+| 平台要求 | mce_inject 内核模块 + mce-inject(8) 工具 | BIOS 暴露 ACPI EINJ 表 + einj 内核模块 |
+| 适用场景 | VM + 物理机（sw 路径通用） | **仅物理机**（需要真实 ACPI 固件支持） |
+
+### 前置准备 (EINJ)
+
+```bash
+# 0. 确认 BIOS 支持 EINJ (看 ACPI 表)
+dmesg | grep -i einj
+# 输出应包含: EINJ: ACPI Error INJection enabled
+
+# 1. 加载 einj 内核模块
+modprobe einj
+# 验证:
+ls /sys/kernel/debug/apei/einj/
+# 应包含: available_error_type  error_inject  error_type  flags  param1  param2
+
+# 2. 查看平台支持的错误类型
+cat /sys/kernel/debug/apei/einj/available_error_type
+# 典型输出:
+#   0x00000001	Processor Correctable
+#   0x00000002	Processor Uncorrectable non-fatal
+#   0x00000004	Processor Uncorrectable fatal
+#   0x00000008	Memory Correctable
+#   0x00000010	Memory Uncorrectable non-fatal
+#   0x00000020	Memory Uncorrectable fatal
+
+# 3. 编译仓库内的用户态工具（ownpage / cfimon）
+make -C test/tools
+
+# 4. BIOS 设置注意事项:
+#   - 某些 BIOS 需要手动启用 EINJ (BIOS Setup -> Advanced -> EINJ / WHEA)
+#   - Intel 平台: 通常在 "Runtime Error Logging" 或 "WHEA" 子菜单
+#   - 华为/Kunpeng: 可能在 "MISC Config" -> "Error Injection" 下
+```
+
+### EINJ Case 矩阵
+
+| # | File | EINJ 错误类型 | 等价 mce-inject case | **无 CFI 行为** | **有 CFI 行为** | 危险等级 |
+|---|------|-------------|---------------------|---------------|---------------|---------|
+| 20 | `20_einj_mem_ce.sh` | Memory Correctable (0x08) | 01/10 | EDAC 记录，页继续使用 | mfi CE 累加，到阈值软下线 | 安全 |
+| 21 | `21_einj_mem_uce_nonfatal.sh` | Memory UCE non-fatal (0x10) | 02/11 (SRAO) | memory_failure 异步，页下线 | + mfi uce_async + netlink | 安全 |
+| 22 | `22_einj_mem_uce_fatal.sh` | **Memory UCE fatal (0x20)** | 03/12 (SRAR) ⭐ | **mce_panic（真实严重性驱动）** | tolerant=3 门控 + memory_failure | ⭐ **panic demo** |
+| 23 | `23_einj_proc_ce.sh` | Processor Correctable (0x01) | 06/14/17 | corrected handler 记录 | ce_count++ | 安全 |
+| 24 | `24_einj_proc_uce_nonfatal.sh` | **Processor UCE non-fatal (0x02)** | 04/13 ⭐ | **平台相关 panic** | **隔离 CPU** | ⭐ **panic demo** |
+| 25 | `25_einj_proc_uce_fatal.sh` | **Processor UCE fatal (0x04)** | (无直接等价) | **必然 panic（PCC=1）** | **CFI 也可能拦不住** | ☠️ **极危险** |
+| 26 | `26_einj_pcie_ce.sh` | PCIe Correctable (0x40) | 08 (部分) | AER handler 记录 | 不在 CFI 域内 | 安全 |
+| 27 | `27_einj_pcie_uce.sh` | PCIe UCE non-fatal (0x80) | 08 (部分) | AER handler 处理 | 不在 CFI 域内 | 低 |
+| 28 | `28_einj_mem_uce_nonfatal_noaddr.sh` | Memory UCE non-fatal (0x10) | 21 变体 | 固件选择受害页 | + mfi 记账 | 中（不可预测） |
+
+### 操作流程 (EINJ)
+
+同 mce-inject cases，每个 case **跑两遍**：
+
+```bash
+# ---- 第一遍：不加载 CFI ----
+rmmod cpu_fault_isolate 2>/dev/null
+modprobe einj
+bash test/inject_cases/20_einj_mem_ce.sh > /tmp/20_no_cfi.txt 2>&1
+
+# ---- 第二遍：加载 CFI ----
+insmod kernel/cpu_fault_isolate.ko ce_threshold=3 uce_threshold=1 \
+    window_secs=60 defer_to_daemon=0 page_ce_threshold=3 \
+    mem_window_secs=300 mem_triage=0 isolation_mode=inactive
+bash test/inject_cases/20_einj_mem_ce.sh > /tmp/20_with_cfi.txt 2>&1
+
+# 对比
+diff -u /tmp/20_no_cfi.txt /tmp/20_with_cfi.txt
+```
+
+### EINJ 的已知边界
+
+1. **仅物理机可用**：VM 内无 ACPI EINJ 表（除非 QEMU 显式模拟 EINJ），所有 EINJ case 在 VM 内会直接 abort。mce-inject 的 sw 路径（cases 01–08）仍是 VM 测试的首选。
+2. **BIOS 必须启用**：部分服务器出厂默认关闭 EINJ，需要进 BIOS Setup 手动打开。
+3. **错误类型因平台而异**：不是所有平台都支持全部 9 种 EINJ 错误类型。脚本会检测 `available_error_type` 并在不支持时 abort（而非报假结果）。
+4. **param3 (APIC ID) 需要内核 4.17+**：老内核的 EINJ debugfs 没有 `param3` 文件，processor 类错误无法指定目标 CPU，固件自行选择。
+5. **Case 25 (Processor UCE fatal) 几乎必然 panic**：PCC=1 是内核 MCE 设计的硬边界，CFI 在这个级别无法挽救。仅用于确认边界行为，**不推荐**用于常规演示。
+
+### 推荐 demo 路径 (EINJ)
+
+**"宕机 vs 存活"演示**：用 case 22 (Memory UCE fatal) 或 case 24 (Processor UCE non-fatal)：
+- 无 CFI 跑一遍 → panic + kdump → 分析 vmcore-dmesg 确认 panic 原因
+- 装 CFI 跑一遍 → 整机存活，error 被记账/隔离
+
+相比 mce-inject cases 12/13，EINJ 的优势是 panic 原因是**真实硬件语义**（"Fatal machine check on current CPU"），而不是 mce-inject 的工艺副作用（"Some CPUs didn't answer in synchronization"）。对外汇报时更有说服力。
+
 ## 这套对外能讲什么
 
-- **CFI 故障覆盖面**：内存 CE/SRAO/SRAR、cache CE/UCE（L2/L3）、TLB UCE、bus UCE、外加内核态 memory_failure 全路径 + 真 #MC 全路径 = 一套完整的 x86 MCE → 隔离策略验证矩阵。
+- **CFI 故障覆盖面**：内存 CE/SRAO/SRAR、cache CE/UCE（L1/L2/L3）、TLB UCE、bus UCE、hwpoison 全路径 + 真 #MC 全路径 + **APEI EINJ 固件路径** = 一套完整的 x86 MCE → 隔离策略验证矩阵，覆盖三层注入（sw decode chain / mce-inject 硬件 / EINJ 固件）。
 - **加载与不加载对比**：每一类故障在无 CFI 时的内核默认行为是什么，有 CFI 后多出哪些动作（隔离、记账、netlink、panic 抑制），都有可重复的对照输出。
-- **整机宕机 vs 存活**：12/13 两个 case 能在物理机上演示，前提是 hw 注入路径未被 vendor 屏蔽。
+- **整机宕机 vs 存活**：
+  - mce-inject: cases 12/13（panic 原因是 sync 超时工艺）
+  - **EINJ: cases 22/24**（panic 原因是真实严重性驱动，更接近真实硬件故障语义）
+  - 两套互为补充：mce-inject 在 VM 上可跑，EINJ 在物理机上更真实。
