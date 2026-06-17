@@ -13,6 +13,8 @@
 set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
+parse_inject_args "$@"
+INJECT_MODE=hw
 status_banner "11 hw Memory SRAO (mce-inject userspace tool, bank=4)"
 require_mce_inject
 

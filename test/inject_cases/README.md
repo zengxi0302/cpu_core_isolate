@@ -126,6 +126,43 @@ bash test/inject_cases/04_cache_uce_l2.sh --hw --mcgstatus=0xf
 - `0xE` = `MCIP|EIPV|LMCE_S`（去掉 RIPV，PCC=1 的非可恢复场景）
 - `0x7` = `MCIP|EIPV|RIPV`（不加 LMCE，仍走广播路径，方便对照）
 
+### `--lmce` 的两条已知边界（HCE2 + 2288H V5 物理机实测）
+
+**边界 1：`--lmce` 对没有 `S`/`AR` 位的事件观察不到信号。**
+
+LMCE 设置 `MCGSTATUS.LMCE_S` 后，内核 do_machine_check 优先看严重性档位。不带 S/AR 位的 UC（SRAO、cache UCE simple-code、TLB UCE、Bus UCE、CE）会走 `machine_check_poll` 这条 polling 路径；MCi_STATUS 又可能被 FMA / SMM scrub，最终既不 panic 也不投递到 decode chain。**`--lmce` 实际只对 SRAR（自带 S+AR）类型的注入有明显效果**（cases 03、12）。其它 case 想走真 #MC 全链路应该用默认 `--hw`（广播路径），CFI notifier 反而能在 broadcast 同步完后接管整个 decode chain。
+
+实测对照：
+
+| Case | `--hw`（broadcast）信号 | `--lmce`（LMCE_S）信号 |
+|------|-------------------------|------------------------|
+| 02 mem SRAO   | uce_async +2，page offlined ✅ | 无 ❌ |
+| 03 mem SRAR   | demoted to async，page offlined ✅ | **触发 `Fatal local machine check` panic ⭐** |
+| 05 L3 UCE     | uce_count +1 ✅ | 无 ❌ |
+| 06 cache CE   | 无（CE 走 CMC，FMA 拦） | 无 ❌ |
+| 07 TLB UCE    | uce_count +1，error_types=0x10 ✅ | 无 ❌ |
+| 08 Bus UCE    | uce_count +1，error_types=0x30 ✅ | 无 ❌ |
+
+**边界 2：`--lmce` + AR 严重性 + 内核态 → CFI 拦不住 panic（这是真实硬件下也无解的边界）。**
+
+03 `--lmce` 即使在 CFI 加载的情况下，仍然 panic：
+
+```
+mce: [Hardware Error]: Machine check: Action required: unknown MCACOD
+Kernel panic - not syncing: Fatal local machine check
+cpu_fault_isolate: PANIC on cpu0: Fatal local machine check
+cpu_fault_isolate: CFI was unable to prevent this panic.
+```
+
+CFI 的 panic_notifier 确实 fire 了，但**没法阻止** —— 因为这条 `mce_panic("Fatal local machine check")` 是 `do_machine_check` 在 `no_way_out` 路径里**无条件触发**的，不被 `mce_tolerant` 门控。原因很硬：内核态遇到 AR 严重性错误，**没有用户进程可以 kill 来恢复**，内核只能死。
+
+**这不是 CFI 的缺陷，是内核 MCE 设计的边界**。CFI 覆盖的是：
+- ✅ 广播 sync 超时 panic（`mce_tolerant=3` 门控）
+- ✅ 非 AR 严重性事件（不到 mce_panic 就处理完了）
+- ❌ 内核态 AR 严重性事件（无论 tolerant 设多少都 panic）
+
+对外汇报时这是个**应该主动讲**的点 —— 它确立了 CFI 价值的真实边界，避免被反问"那真坏 DIMM 命中内核态的时候 CFI 救得了吗"。诚实答："救不了，那种情况下真实硬件下也会 panic；CFI 把不必要的 panic（mce-inject 工艺、广播 sync 误判）拦住了。"
+
 09 hwpoison_inject 走 `memory_failure` 直调，跟 MCE 通路无关，`--hw` 不适用，参数会被忽略。
 
 10–14 是"始终 hw"快捷形态（永远走真 #MC，无 `--sw` 选项），主要用来固化 panic-vs-isolate 演示与对外说法。功能上 `01–06 --hw` 与 10–14 等价；保留 10–14 是为了让"hw 路径"这条话术在脚本目录里一眼可见。

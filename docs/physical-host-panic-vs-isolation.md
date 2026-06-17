@@ -233,8 +233,51 @@ top -d 1                              # 期望: 目标 cpu idle ≈100%
 
 不要把这条 panic 的成因泛化成"任何 UC 注入都会 panic"。它是"Intel 广播 MCE 同步超时" 这条具体路径，跟 `mce_tolerant` 门控直接相关。CFI 的价值不是"消除 #MC"，而是"接管 #MC 后续处置"。
 
+## 补充实验：`--lmce` 揭示的真实硬件路径
+
+默认 `--hw` 注入（mce-inject 单 CPU raise）触发的 panic 信息是 `Some CPUs didn't answer in synchronization` —— 这条路径是 **mce-inject 工艺**，不是真实硬件常见模式。真实硬件下 MCA 微码会同步广播给所有核，sync 必过，panic 由 `mce_severity` 决策。
+
+加 `--lmce` 后 `MCGSTATUS=0xF`（含 `LMCE_S` 位），告诉内核这是 Local MCE，绕过广播 sync，走 severity-driven 路径。物理机实测：
+
+```
+mce: [Hardware Error]: CPU 0: Machine Check Exception: f Bank 4: bd80000000000094
+                                                      ^
+                                          MCGSTATUS=0xf, LMCE_S 起作用
+
+mce: [Hardware Error]: Machine check: Action required: unknown MCACOD
+Kernel panic - not syncing: Fatal local machine check
+                                  ^^^^^
+                              这就是真实硬件 panic 的标准信息
+```
+
+panic 信息从 `Fatal machine check`（广播版本，mce-inject 工艺）变成 `Fatal local machine check`（LMCE 版本，对应真实硬件路径）。对外讲故事时，`--lmce` 的 vmcore 比默认 `--hw` 的 vmcore **更接近真实硬件故障**。
+
+## CFI 的真实覆盖边界
+
+`--lmce + AR 严重性` 实验暴露了 CFI 的一条真实覆盖边界 —— **加载 CFI 之后这条 panic 仍然发生**：
+
+```
+cpu_fault_isolate: PANIC on cpu0: Fatal local machine check
+cpu_fault_isolate: CFI was unable to prevent this panic.
+                   Check if the fault source is covered by CFI.
+```
+
+原因在内核 MCE 处理本身：`do_machine_check` 在 `no_way_out` 路径调 `mce_panic("Fatal local machine check")` 时是**无条件触发**，不受 `mce_tolerant` 门控。内核态遇到 AR 严重性错误，没有用户进程可 kill 来恢复，内核就只能死。这是真实硬件下也无解的边界。
+
+CFI 的覆盖矩阵：
+
+| 场景 | 内核默认（无 CFI）| CFI 加载后 | 机制 |
+|------|-------------------|------------|------|
+| 广播 MCE sync 超时（mce-inject 单核 raise） | `mce_panic("Fatal machine check")` | **不 panic**，事件经 decode chain 处理 | `mce_tolerant=3` 门控 sync 超时分支 |
+| 非 AR 严重性事件（SRAO / cache UCE / TLB UCE / Bus UCE） | 各自的轻量处理或忽略 | CFI notifier 接管，分类、隔离、netlink | decode chain 注册 |
+| 内核态 AR 严重性事件（如 `--lmce` + SRAR） | `mce_panic("Fatal local machine check")` | **同样 panic**，CFI panic_notifier 只能 logging | 内核无条件路径，tolerant 无能为力 |
+
+**汇报时这一条建议主动讲**：CFI 的卖点不是"消灭所有 panic"，而是"消灭那些原本不该 panic 的 panic（mce-inject 工艺、广播误判等不必要的整机宕机），让真正不可恢复的故障走 kdump 兜底，可控地保留现场。"
+
 ## 已知限制
 
 1. **Hardware-first MCE 路径**：本物理机 RAS 用 FMA (firmware-first)，**真正的硬件 #MC**（真坏 DIMM）会被 BIOS SMM 先接走，再以 APEI/GHES 形式喂给 OS。本实验展示的是 OS 注入路径，FMA 路径下 CFI 走的是另一组通知器（`fma_memory_offline_notify` → cfi mfi page handler）。两条路径都有覆盖。
-2. **Full 模式依赖 livepatch**：见上节。
-3. **Inactive 模式不下线 CPU**：cpu 仍然占资源（电、缓存、内存控制器配置），只是不再调度任务。如果客户要求"故障 CPU 彻底下电"，需要走 full 模式 + livepatch，或者人工 `echo 0 > /sys/devices/system/cpu/cpuN/online`。
+2. **`--lmce` 仅对带 S+AR 位的注入有明显效果**：不带 S/AR 的 UC（SRAO、cache UCE simple-code、TLB UCE、Bus UCE、CE）在 LMCE 模式下走 polling 路径，MCi_STATUS 又会被 FMA scrub，最终既不 panic 也不投递到 decode chain。这些 case 想走真 #MC 链路应该用默认 `--hw`（广播路径），CFI notifier 反而能在 sync 后接管 decode chain。
+3. **CFI 拦不住内核态 AR severity panic**：见上节"CFI 的真实覆盖边界"。
+4. **Full 模式依赖 livepatch**：见前面"Full 模式边界条件"节。
+5. **Inactive 模式不下线 CPU**：cpu 仍然占资源（电、缓存、内存控制器配置），只是不再调度任务。如果客户要求"故障 CPU 彻底下电"，需要走 full 模式 + livepatch，或者人工 `echo 0 > /sys/devices/system/cpu/cpuN/online`。

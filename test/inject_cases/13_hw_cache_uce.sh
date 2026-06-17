@@ -33,6 +33,8 @@
 set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
+parse_inject_args "$@"
+INJECT_MODE=hw
 TC=$(safe_cpu)
 status_banner "13 hw L2 Cache UCE on cpu$TC (mce-inject userspace tool, bank=1)"
 require_mce_inject

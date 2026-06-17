@@ -18,6 +18,8 @@
 set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
+parse_inject_args "$@"
+INJECT_MODE=hw   # this case is always real-#MC; --sw is ignored
 status_banner "10 hw Memory CE (mce-inject userspace tool, bank=4)"
 require_mce_inject
 

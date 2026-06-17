@@ -25,6 +25,8 @@
 set -u
 cd "$(dirname "$0")/../.."
 source test/inject_cases/env.sh
+parse_inject_args "$@"
+INJECT_MODE=hw
 status_banner "12 hw Memory SRAR (mce-inject userspace tool, bank=4)"
 require_mce_inject
 
@@ -38,7 +40,7 @@ if ! cfi_loaded; then
     sleep 5
 fi
 
-US0=$(mfi_stat uce_sync)
+US0=$(mfi_stat uce_consumed)
 UA0=$(mfi_stat uce_async)
 OFF0=$(mfi_stat pages_offlined)
 own_page hw_mem_srar
@@ -48,14 +50,14 @@ dmesg_mark
 mce_inject_file "$PROBE_CPU" 4 "$STAT_MEM_SRAR" "$PADDR" 0x0
 sleep 3
 
-US1=$(mfi_stat uce_sync)
+US1=$(mfi_stat uce_consumed)
 UA1=$(mfi_stat uce_async)
 OFF1=$(mfi_stat pages_offlined)
 OWNER_ALIVE=$(kill -0 "$PFN_OWNER_PID" 2>/dev/null && echo "alive" || echo "killed (SIGBUS)")
 
 echo
 echo "  observations:"
-observe_row "mfi uce_sync"       "$US0"  "$US1"
+observe_row "mfi uce_consumed"   "$US0"  "$US1"
 observe_row "mfi uce_async"      "$UA0"  "$UA1"
 observe_row "mfi pages_offlined" "$OFF0" "$OFF1"
 echo "    owner process           : $OWNER_ALIVE"
