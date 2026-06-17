@@ -472,58 +472,29 @@ fi
 if [[ $WITH_HW == 1 ]]; then
     hdr "C hw-mode: real #MC exception handler path"
 
-    # ---- C0 hw 投递可用性探测 (双路径) ----
-    # 两条投递路径在不同环境上不等价:
-    #   - 物理机 HCE2 + Huawei 2288H V5 (FMA firmware-first):
-    #     mce-inject(8) 用户态工具 -> raise -> NMI -> do_machine_check (实测有)
-    #     直接 debugfs flags=hw -> CMC/IRQ 路径 (实测无 / vendor 拦)
-    #   - 云 VM (KVM nested w/ MCE virt):
-    #     debugfs flags=hw -> KVM 模拟 #MC (实测有)
-    #     mce-inject(8) 用户态工具 -> 没有走通 (尚未确证原因)
-    # 因此探测先试 userspace 工具, 不通就试 debugfs flags=hw; 把成功的方法
-    # 记到 INJECT_METHOD, C1-C5 沿用该方法注入.
-    HW_AVAILABLE=0
+    # ---- C0 hw 路径选择 (无探测) ----
+    # 之前版本用 mem CE 探测投递路径, 但 HCE2 物理机上 CE 走 CMC IRQ ->
+    # machine_check_poll, FMA / vendor SMM 把 MCi_STATUS scrub 掉再让 poll
+    # 读, 探测看不到任何信号, 误报 "no delivery". UC + NMI 路径不被 FMA
+    # 拦, 是 .mce 实测可用的路径, 但用 UC 做探测会把 probe cpu 隔离掉, 还
+    # 要清理, 复杂度过高. 现在: 工具在就用 mce-inject(8), 不在就回退到
+    # debugfs flags=hw, C1-C5 各自观测信号, 没观测到的报 bad/skip.
+    HW_AVAILABLE=1
     INJECT_METHOD=
-    HW_REASON=""
+    if command -v mce-inject >/dev/null 2>&1; then
+        INJECT_METHOD=file
+        log "  hw inject path: mce-inject(8) userspace tool"
+    else
+        INJECT_METHOD=hw
+        log "  hw inject path: debugfs flags=hw (mce-inject(8) not installed)"
+    fi
+    ok "hw injection path selected ($INJECT_METHOD)"
 
-    dmesg -c >/dev/null 2>&1
+    # 取一个 ownpage 给 C1-C3 内存类 case 复用
     ./test/tools/ownpage > "$LOGDIR/inj_op_c0.txt" & C0PID=$!; sleep 1
     PFN_C0=$(awk -F= '/^pfn/{print $2}' "$LOGDIR/inj_op_c0.txt")
     [[ -z "$PFN_C0" ]] && PFN_C0=0x0
     PADDR_C0=$(printf "0x%x" $((PFN_C0 * 4096)))
-    PROBE_CPU=$(($(nproc) / 2))
-    [[ $PROBE_CPU -le 0 ]] && PROBE_CPU=1
-
-    try_probe() {
-        local method=$1
-        local before after
-        before=$(awk '/ce_total/{print $2}' $MEM/stats)
-        case $method in
-            file) mce_inject_file "$PROBE_CPU" 4 "$STAT_MEM_CE" "$PADDR_C0" 0 ;;
-            hw)   mce_inject hw 4 "$STAT_MEM_CE" "$PADDR_C0" 0 "$PROBE_CPU" ;;
-        esac
-        sleep 2
-        after=$(awk '/ce_total/{print $2}' $MEM/stats)
-        [[ $after -gt $before ]] && return 0
-        dmesg | tail -50 | grep -qE "mce: \[Hardware Error\]|Triggering MCE exception" && return 0
-        return 1
-    }
-
-    log "  probing hw delivery (mem CE on cpu$PROBE_CPU)..."
-    if command -v mce-inject >/dev/null 2>&1 && try_probe file; then
-        INJECT_METHOD=file
-        HW_AVAILABLE=1
-        log "    path: mce-inject(8) userspace tool (verified HCE2 physical)"
-    elif try_probe hw; then
-        INJECT_METHOD=hw
-        HW_AVAILABLE=1
-        log "    path: debugfs flags=hw (verified cloud KVM)"
-    elif dmesg | grep -qE "unchecked MSR access error: WRMSR"; then
-        HW_REASON="WRMSR to MCi_STATUS triggered #GP (vendor kernel / guest blocks MSR write)"
-    else
-        HW_REASON="no #MC delivered by either path (firmware-first BIOS / KVM without MCE virt)"
-    fi
-
     kill $C0PID 2>/dev/null
 
     # Wrapper: 用 INJECT_METHOD 选中的路径注入. 参数: <cpu> <bank> <status> <addr> <misc>
@@ -534,22 +505,6 @@ if [[ $WITH_HW == 1 ]]; then
             hw|*) mce_inject hw "$bank" "$status" "$addr" "$misc" "$cpu" ;;
         esac
     }
-
-    if [[ $HW_AVAILABLE == 0 ]]; then
-        skip "hw-mode unavailable: $HW_REASON"
-        skip "C1 hw mem CE (hw-mode unavailable)"
-        skip "C2 hw mem SRAO (hw-mode unavailable)"
-        skip "C3 hw mem SRAR (hw-mode unavailable)"
-        skip "C4 hw cache UCE (hw-mode unavailable)"
-        skip "C5 hw cache CE (hw-mode unavailable)"
-        log "  Why: real #MC delivery needs either bare-metal w/ OS-first MCE +"
-        log "       mce-inject(8) tool, or KVM guest w/ full MCE virtualization."
-        log "       sw mode already covers x86_mce_decoder_chain end-to-end (A1-A7);"
-        log "       hwpoison_inject covers memory_failure full path (B);"
-        log "       only do_machine_check / mce_severity prologue stays unexercised."
-    else
-        ok "hw delivery functional via $INJECT_METHOD"
-    fi
 
 if [[ ${HW_AVAILABLE:-0} == 1 ]]; then
     # 取一些干净 pfn 给内存类 case 用

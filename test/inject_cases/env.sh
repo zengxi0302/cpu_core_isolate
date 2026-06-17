@@ -50,79 +50,27 @@ parse_inject_args() {
     done
 }
 
-# Lazy probe of hw delivery. Picks the working path between userspace
-# mce-inject(8) (HCE2 physical) and debugfs flags=hw (cloud KVM).
-_HW_PROBE_DONE=0
-HW_METHOD=
-HW_AVAILABLE=0
-HW_PROBE_REASON=""
-_hw_probe_once() {
-    [[ $_HW_PROBE_DONE == 1 ]] && return
-    _HW_PROBE_DONE=1
-    require_mce_inject
-    # Use addr=0 (no own_page) so the probe is transparent to the case script.
-    # The probe is non-destructive to dmesg: we drop a unique marker and grep
-    # only the lines AFTER the marker.
-    local probe_cpu=$(safe_cpu) ce_bef ce_aft
-    local probe_mark="HW-PROBE-$$-$(date +%s%N)"
-    local _saw_log
-
-    _probe_saw_signal() {
-        local ce0=$1 ce1=$2
-        [[ "$ce1" != "(n/a)" && "${ce1:-0}" -gt "${ce0:-0}" ]] && return 0
-        dmesg | awk -v m="$probe_mark" 'p{print} $0~m{p=1}' | \
-            grep -qE 'mce: \[Hardware Error\]|Triggering MCE exception' && return 0
-        return 1
-    }
-
-    echo "$probe_mark" >/dev/kmsg 2>/dev/null
-    if command -v mce-inject >/dev/null 2>&1; then
-        ce_bef=$(mfi_stat ce_total)
-        mce_inject_file "$probe_cpu" 4 "$STAT_MEM_CE" 0 0 >/dev/null 2>&1 || true
-        sleep 2
-        ce_aft=$(mfi_stat ce_total)
-        if _probe_saw_signal "$ce_bef" "$ce_aft"; then
-            HW_METHOD=file
-            HW_AVAILABLE=1
-            return
-        fi
-    fi
-
-    echo "$probe_mark" >/dev/kmsg 2>/dev/null
-    ce_bef=$(mfi_stat ce_total)
-    mce_submit hw 4 "$STAT_MEM_CE" 0 0 "$probe_cpu" >/dev/null 2>&1 || true
-    sleep 2
-    ce_aft=$(mfi_stat ce_total)
-    if _probe_saw_signal "$ce_bef" "$ce_aft"; then
-        HW_METHOD=hw
-        HW_AVAILABLE=1
-        return
-    fi
-
-    HW_AVAILABLE=0
-    if dmesg | grep -qE 'unchecked MSR access error: WRMSR'; then
-        HW_PROBE_REASON="WRMSR to MCi_STATUS triggered #GP (vendor kernel / guest blocks MSR write)"
-    elif ! command -v mce-inject >/dev/null 2>&1; then
-        HW_PROBE_REASON="mce-inject(8) absent and debugfs flags=hw did not deliver"
-    else
-        HW_PROBE_REASON="neither mce-inject(8) tool nor debugfs flags=hw delivered #MC"
-    fi
-}
-
-# Real #MC injection (auto-selects userspace tool vs debugfs).
+# Real #MC injection (no upfront probe — picks path purely by tool presence).
+#
+# Why no probe: an earlier version tried to detect delivery by injecting a
+# memory CE and watching for ce_total / dmesg signals. That mis-fires on
+# HCE2 physical hosts: CE delivery goes through CMC IRQ -> machine_check_poll,
+# and FMA / vendor SMM scrubs MCi_STATUS before the poll reads it back, so
+# the probe sees "no delivery" even though UC delivery via NMI works fine
+# (the manual mce-inject .mce experiments prove that). Probing without
+# isolating a CPU as a side effect requires choosing a signal that's safe,
+# and there isn't one that's also universal. Better to just dispatch and
+# let each case observe its own result.
+#
 # Usage: mce_inject_hw <cpu> <bank> <status> <addr> <misc>
 mce_inject_hw() {
     local cpu=$1 bank=$2 status=$3 addr=${4:-0} misc=${5:-0}
-    _hw_probe_once
-    if [[ $HW_AVAILABLE == 0 ]]; then
-        echo "  [ABORT] hw mode requested but no working delivery path:"
-        echo "          $HW_PROBE_REASON"
-        return 1
+    require_mce_inject
+    if command -v mce-inject >/dev/null 2>&1; then
+        mce_inject_file "$cpu" "$bank" "$status" "$addr" "$misc"
+    else
+        mce_submit hw "$bank" "$status" "$addr" "$misc" "$cpu"
     fi
-    case "$HW_METHOD" in
-        file) mce_inject_file "$cpu" "$bank" "$status" "$addr" "$misc" ;;
-        hw|*) mce_submit hw "$bank" "$status" "$addr" "$misc" "$cpu" ;;
-    esac
 }
 
 # Dispatch sw or hw based on INJECT_MODE.
