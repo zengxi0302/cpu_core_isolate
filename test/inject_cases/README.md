@@ -21,6 +21,31 @@
 
 **已在 HCE2 + 2288H V5 物理机实证**：cases 12 与 13 的 .mce 注入，无 CFI 时触发 `mce_panic + kdump`，加载 CFI（inactive 模式）后同样注入只导致目标 cpu 被 inactive-isolated，整机存活。详见 `docs/physical-host-panic-vs-isolation.md`。
 
+## 模式适用速查表
+
+| # | Case | 默认 sw | `--hw` | `--lmce` | 备注 |
+|---|------|--------|--------|---------|------|
+| 01 | mem CE | ✅ | ❌ | ❌ | CE 走 CMC IRQ，HCE2 FMA 拦 |
+| 02 | mem SRAO | ✅ | ✅ | ❌ | LMCE 路径要求 S/AR 位 |
+| 03 | **mem SRAR** | ✅ | ✅ | ⭐ **panic demo** | **`--lmce` 唯一真实用例**（S+AR）|
+| 04 | cache UCE L2 | ✅ | ✅ | ❌ | 无 S/AR |
+| 05 | cache UCE L3 | ✅ | ✅ | ❌ | 无 S/AR |
+| 06 | cache CE | ✅ | ❌ | ❌ | CE 走 CMC，FMA 拦 |
+| 07 | TLB UCE | ✅ | ✅ | ❌ | 无 S/AR |
+| 08 | Bus UCE | ✅ | ✅ | ❌ | 无 S/AR |
+| 09 | hwpoison | ✅ | (sw) | (sw) | 不走 MCE 链路，参数被忽略 |
+| 10 | hw mem CE | – | ❌ | ❌ | 同 case 01 hw 路径 |
+| 11 | hw mem SRAO | – | ✅ | ❌ | 同 case 02 |
+| 12 | **hw mem SRAR** | – | ✅ | ⭐ **panic demo** | 同 case 03，"始终 hw"入口 |
+| 13 | hw cache UCE | – | ✅ | ❌ | 同 case 04 |
+| 14 | hw cache CE | – | ❌ | ❌ | 同 case 06 |
+
+图例：✅ 工作；❌ 该平台不投递；⭐ 强烈推荐用于 demo。
+
+**两条平台限制（HCE2 + 2288H V5 实测）**：
+1. **CE 经 hw raise 不投递**（cases 01/06/10/14 的 `--hw`）—— CE 走 CMC IRQ，HCE2 FMA 在这条 polling 路径上拦截、scrub MCi_STATUS。**用默认 sw 注入做 CE 测试**。
+2. **`--lmce` 仅对自带 S/AR 位的注入有效**（即 case 03 / 12 SRAR）—— LMCE 路径要求 AR severity 才完整走 do_machine_check。**用 `--lmce` 做 panic demo 时选 03 或 12**。
+
 ## 对照矩阵
 
 | # | File | 故障类型 | 注入路径 | bank | MCi_STATUS | **无 CFI 行为** | **有 CFI 行为** |

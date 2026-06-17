@@ -9,6 +9,13 @@
 #   no  CFI  : CMC corrected handler logs; no panic; no isolation.
 #   has CFI  : cfi ce_count++ on the originating cpu; CE alone never
 #              isolates (matches case 06 for the real-#MC path).
+#
+#   PLATFORM LIMITATION — HCE2 + 2288H V5 (and FMA-firmware-first kernels
+#   in general): CE via hw raise goes through CMC IRQ -> machine_check_poll,
+#   and FMA / vendor SMM scrubs MCi_STATUS before the poll reads it back.
+#   Expected on HCE2: "cfi ce_count: 0 -> 0  [delta=0]" — not a script bug,
+#   firmware-first interception of the CMC path. For cache CE testing on
+#   HCE2 use case 06 (sw flag).
 
 set -u
 cd "$(dirname "$0")/../.."

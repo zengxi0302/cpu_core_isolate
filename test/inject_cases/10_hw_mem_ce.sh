@@ -10,10 +10,16 @@
 #   no  CFI  : real #MC corrected-path; EDAC logs; no panic (CE).
 #   has CFI  : same path + cfi mfi CE accounting + netlink.
 #
-#   The original draft of this case used a debugfs flags=hw "WRMSR no-op"
-#   probe which gave a false negative on HCE2 physical hosts. The userspace
-#   tool is the verified path — empirically delivers #MC NMI even on
-#   FMA-configured Purley platforms.
+#   PLATFORM LIMITATION — HCE2 + Huawei 2288H V5 (and other FMA-firmware-
+#   first platforms): CE injection via mce-inject(8) raise goes through
+#   CMC IRQ -> machine_check_poll on the target CPU. FMA / vendor SMM
+#   scrubs MCi_STATUS before the poll reads it back, so the kernel sees
+#   nothing and CFI's ce_total never moves. Expected output is
+#   "mfi ce_total: 0 -> 0   [delta=0]" on this platform — that is NOT a
+#   script bug, it's the firmware-first interception of the CMC path.
+#   For memory CE testing on HCE2 use case 01 (sw flag).
+#   The hw CE path works on platforms without FMA (e.g. cloud KVM with
+#   full MCE virtualization), which is why this case is kept.
 
 set -u
 cd "$(dirname "$0")/../.."

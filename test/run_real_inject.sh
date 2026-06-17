@@ -113,6 +113,17 @@ modprobe hwpoison_inject 2>&1 | tee -a "$REPORT"
                    || { bad "mce-inject debugfs missing"; exit 1; }
 command -v mce-inject >/dev/null 2>&1 && ok "mce-inject(8) userspace tool present" \
                                       || skip "mce-inject(8) tool absent (C段 hw 路径会 SKIP)"
+
+# Detect FMA (HCE2 firmware-first MCE handling). FMA intercepts the CMC IRQ
+# polling path, so hw CE injection via mce-inject(8) raise will silently drop
+# (CFI ce_total stays 0). C1 / C5 (hw mem CE / hw cache CE) become SKIP-with-
+# reason rather than FAIL on these platforms. UC injection via NMI is not
+# affected — C2/C3/C4 work fine.
+HAS_FMA=0
+if grep -qE 'fma_memory_offline_notify|fma_uce_notify' /proc/kallsyms 2>/dev/null; then
+    HAS_FMA=1
+    log "  [INFO] FMA detected — hw CE paths (C1/C5) will SKIP (FMA scrubs CMC IRQ)"
+fi
 [[ -f "$HWP_DIR/corrupt-pfn" ]] && ok "hwpoison-inject debugfs available" \
                                || skip "hwpoison-inject debugfs not present"
 
@@ -537,8 +548,13 @@ if [[ ${HW_AVAILABLE:-0} == 1 ]]; then
     inject_real 0 4 "$STAT_MEM_CE" "$PADDR_C2" 0
     sleep 2
     CE_C1=$(awk '/ce_total/{print $2}' $MEM/stats)
-    [[ $CE_C1 -gt $CE_C0 ]] && ok "hw mem CE flowed through real #MC handler (delta=$((CE_C1-CE_C0)))" \
-                            || bad "hw mem CE not visible (delta=0)"
+    if [[ $CE_C1 -gt $CE_C0 ]]; then
+        ok "hw mem CE flowed through real #MC handler (delta=$((CE_C1-CE_C0)))"
+    elif [[ $HAS_FMA == 1 ]]; then
+        skip "hw mem CE not visible: FMA scrubs CMC IRQ path on this kernel (use sw A1 for CE)"
+    else
+        bad "hw mem CE not visible (delta=0)"
+    fi
 
     # ---- C2 hw memory SRAO: 真 #MC -> mce_severity=AO -> memory_failure_queue ----
     log "  --- C2 hw memory SRAO (UC+EN+MISCV+ADDRV, expect async UCE) ---"
@@ -613,8 +629,13 @@ if [[ ${HW_AVAILABLE:-0} == 1 ]]; then
     inject_real "$TCC" 3 "$STAT_CACHE_CE_L2" 0 0
     sleep 2
     CC_C1=$(cat /sys/devices/system/cpu/cpu$TCC/cfi/ce_count 2>/dev/null || echo 0)
-    [[ $CC_C1 -gt $CC_C0 ]] && ok "hw cache CE counted (delta=$((CC_C1-CC_C0)))" \
-                            || bad "hw cache CE not counted"
+    if [[ $CC_C1 -gt $CC_C0 ]]; then
+        ok "hw cache CE counted (delta=$((CC_C1-CC_C0)))"
+    elif [[ $HAS_FMA == 1 ]]; then
+        skip "hw cache CE not counted: FMA scrubs CMC IRQ path on this kernel (use sw A5 for CE)"
+    else
+        bad "hw cache CE not counted"
+    fi
     [[ $(cat /sys/devices/system/cpu/cpu$TCC/online) == 1 ]] && ok "hw CE alone did not isolate" \
                                                             || bad "hw CE caused isolation!"
 
