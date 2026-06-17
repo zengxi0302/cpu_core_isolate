@@ -122,6 +122,18 @@ require_einj_type() {
         echo "[ABORT] EINJ error type $desc ($(printf '0x%08x' "$etype")) not available"
         echo "  Available types:"
         cat $EINJ_DIR/available_error_type 2>/dev/null | sed 's/^/    /'
+        # Platform-specific guidance
+        case "$etype" in
+            "$EINJ_PROC_CE"|"$EINJ_PROC_UCE_NONFATAL"|"$EINJ_PROC_UCE_FATAL")
+                echo
+                echo "  Many server platforms (including HCE2/Huawei 2288H) do not expose"
+                echo "  Processor error types via EINJ — only Memory and PCIe are available."
+                echo "  For CPU/cache fault injection, use the mce-inject cases instead:"
+                echo "    Cache CE:  test/inject_cases/06_cache_ce_l2.sh"
+                echo "    Cache UCE: test/inject_cases/04_cache_uce_l2.sh --hw"
+                echo "    (or cases 13/14 for always-hw variants)"
+                ;;
+        esac
         exit 1
     fi
     echo "  EINJ type $(printf '0x%08x' "$etype") ($desc) is available"

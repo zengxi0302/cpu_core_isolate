@@ -31,15 +31,18 @@ own_page einj_mem_uce_nonfatal
 dmesg_mark
 
 einj_inject_mem "$EINJ_MEM_UCE_NONFATAL" "$PADDR"
-sleep 3
+# EINJ firmware path is slower than mce-inject: firmware processes the
+# EINJ action → creates CPER → triggers GHES NMI/SCI → kernel handles.
+# 3s is too tight on HCE2 (events arrive ~3.06s after inject); use 5s.
+sleep 5
 
 UA1=$(mfi_stat uce_async)
 OFF1=$(mfi_stat pages_offlined)
 OWNER_ALIVE=$(kill -0 "$PFN_OWNER_PID" 2>/dev/null && echo "alive" || echo "killed")
 # EINJ memory_failure may deliver SIGBUS to any process mapping the page,
 # not necessarily our ownpage helper (e.g., awk from a pipe reading /proc).
-# Check dmesg for the actual SIGBUS target.
-SIGBUS_TARGET=$(dmesg_since_mark | grep -oP 'Sending SIGBUS to \K\S+' | tail -1)
+# Check dmesg for the actual SIGBUS target (portable: no grep -P).
+SIGBUS_TARGET=$(dmesg_since_mark | sed -n 's/.*Sending SIGBUS to \([^ ]*\).*/\1/p' | tail -1)
 
 echo
 echo "  observations:"

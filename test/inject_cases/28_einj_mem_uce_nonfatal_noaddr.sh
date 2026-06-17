@@ -16,10 +16,14 @@
 #   no  CFI  : kernel's GHES handler calls memory_failure; page offlined.
 #   has CFI  : cfi mfi accounts the error; page offlined + netlink.
 #
-#   CAUTION: the firmware picks the victim — it may hit a kernel page,
-#   an in-use application page, or a free page. Impact is unpredictable.
-#   On most platforms, firmware picks a "safe" sacrificial page, but
-#   this is not guaranteed.
+#   !! DANGER !! — Without address targeting, the firmware picks the
+#   victim page. On HCE2 physical hosts this has been observed to hit
+#   kernel pages or critical application memory, causing system hang or
+#   panic. This case should ONLY be run when:
+#     - kdump is configured and working
+#     - kernel.panic > 0 (auto-reboot after crash)
+#     - You are prepared to lose the SSH session
+#   Use case 21 (address-targeted) for safe, repeatable testing.
 
 set -u
 cd "$(dirname "$0")/../.."
@@ -28,14 +32,25 @@ einj_banner "28 EINJ Memory UCE non-fatal (no address targeting)"
 require_einj
 require_einj_type "$EINJ_MEM_UCE_NONFATAL" "Memory Uncorrectable non-fatal"
 
+echo
+echo "  !! DANGER: No address targeting — firmware picks the victim page."
+echo "  !! On HCE2 this has caused system hang (firmware hit kernel page)."
+echo "  !! Use case 21 (address-targeted) for safe, repeatable testing."
+echo "  !! This case is for boundary/stress testing ONLY."
+echo
+echo "  pre-state:"
+echo "    /proc/sys/kernel/panic = $(cat /proc/sys/kernel/panic 2>/dev/null || echo '?')"
+echo "    kdump: $(systemctl is-active kdump 2>/dev/null || echo 'unknown')"
+echo
+echo "  Press Ctrl-C within 10s to abort."
+sleep 10
+
 UA0=$(mfi_stat uce_async)
 OFF0=$(mfi_stat pages_offlined)
 dmesg_mark
 
-echo "  [INFO] No address targeting — firmware chooses victim page."
-echo "  [INFO] Impact depends on which page firmware picks."
 einj_inject "$EINJ_MEM_UCE_NONFATAL"
-sleep 3
+sleep 5
 
 UA1=$(mfi_stat uce_async)
 OFF1=$(mfi_stat pages_offlined)

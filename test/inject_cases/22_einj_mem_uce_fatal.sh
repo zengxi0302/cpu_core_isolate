@@ -49,7 +49,7 @@ own_page einj_mem_uce_fatal
 dmesg_mark
 
 einj_inject_mem "$EINJ_MEM_UCE_FATAL" "$PADDR"
-sleep 3
+sleep 5
 
 US1=$(mfi_stat uce_consumed)
 UA1=$(mfi_stat uce_async)
