@@ -36,12 +36,23 @@ sleep 3
 UA1=$(mfi_stat uce_async)
 OFF1=$(mfi_stat pages_offlined)
 OWNER_ALIVE=$(kill -0 "$PFN_OWNER_PID" 2>/dev/null && echo "alive" || echo "killed")
+# EINJ memory_failure may deliver SIGBUS to any process mapping the page,
+# not necessarily our ownpage helper (e.g., awk from a pipe reading /proc).
+# Check dmesg for the actual SIGBUS target.
+SIGBUS_TARGET=$(dmesg_since_mark | grep -oP 'Sending SIGBUS to \K\S+' | tail -1)
 
 echo
 echo "  observations:"
 observe_row "mfi uce_async"      "$UA0"  "$UA1"
 observe_row "mfi pages_offlined" "$OFF0" "$OFF1"
-echo "    owner process           : $OWNER_ALIVE"
+echo "    owner process (ownpage) : $OWNER_ALIVE (pid=$PFN_OWNER_PID)"
+[[ -n "${SIGBUS_TARGET:-}" ]] && echo "    SIGBUS delivered to       : $SIGBUS_TARGET (from dmesg)"
+# Check dmesg for memory_failure recovery on our target pfn
+if dmesg_since_mark | grep -q "Memory failure.*$(printf '0x%x' "$PFN")"; then
+    echo "    memory_failure           : fired on pfn=$PFN"
+else
+    echo "    memory_failure           : not observed on pfn=$PFN (check dmesg)"
+fi
 echo "    dmesg (relevant):"
 dmesg_digest | sed 's/^/      /'
 

@@ -45,5 +45,17 @@ observe_row "mfi ce_total"           "$CE0"  "$CE1"
 observe_row "mfi pages_pre_offlined" "$PRE0" "$PRE1"
 echo "    dmesg (relevant):"
 dmesg_digest | sed 's/^/      /'
+# On HCE2/FMA platforms, EINJ Memory CE may also be silently consumed
+# by firmware (FMA intercepts GHES CE records before EDAC/CFI see them).
+# If dmesg is empty and ce_total didn't move, this is the likely cause.
+if ! dmesg_since_mark | grep -qE 'Hardware Error|GHES|EDAC|memory_failure|cpu_fault_isolate'; then
+    echo
+    echo "  [INFO] No kernel-side trace for Memory CE injection."
+    echo "  Possible causes:"
+    echo "    - FMA firmware-first handling consumed the CE silently"
+    echo "    - GHES CE path doesn't log to dmesg on this platform"
+    echo "    - EINJ CE was accepted but not actually delivered"
+    echo "  Try: dmesg | grep -i 'corrected\|ghes\|edac\|hardware error'"
+fi
 
 own_page_release

@@ -45,6 +45,11 @@ EINJ_FLAG_PCIE_SBDF_VALID=0x4     # param3 = SBDF
 # Override inject mode display for EINJ cases
 INJECT_MODE=einj
 
+# Extend dmesg grep to include GHES/APEI/EINJ-specific kernel messages.
+# The base env.sh defines dmesg_relevant_grep for mce-inject patterns;
+# EINJ errors flow through GHES and produce different log lines.
+dmesg_relevant_grep="$dmesg_relevant_grep|GHES|APEI|Hardware Error|ghes_proc|error_severity|EINJ|fma_|RAS:"
+
 # Override status_banner to show EINJ mode
 einj_banner() {
     echo "================================================================"
@@ -81,20 +86,32 @@ require_einj() {
 
 # Check if a specific error type is supported by the platform.
 # Usage: einj_type_available 0x00000008
+#
+# available_error_type has two known formats:
+#   1. Single bitmask:       "0x000000ff\n"
+#   2. Per-line descriptors: "0x00000001\tProcessor Correctable\n0x00000008\t..."
+# Handle both without triggering set -u errors in arithmetic.
 einj_type_available() {
     local etype=$1
-    local avail
-    avail=$(cat $EINJ_DIR/available_error_type 2>/dev/null)
-    if [[ -z "$avail" ]]; then
+    local raw
+    raw=$(cat $EINJ_DIR/available_error_type 2>/dev/null)
+    if [[ -z "$raw" ]]; then
         echo "[WARN] cannot read available_error_type"
         return 1
     fi
-    if echo "$avail" | grep -q "$(printf '0x%08x' "$etype")"; then
+    # Format 2: multi-line with per-type hex — grep for exact 0x-prefixed match
+    local etype_fmt
+    etype_fmt=$(printf '0x%08x' "$etype")
+    if echo "$raw" | grep -q "$etype_fmt"; then
         return 0
     fi
-    local avail_hex
-    avail_hex=$(printf '0x%x' "$((avail & etype))")
-    [[ "$avail_hex" != "0x0" ]] && return 0
+    # Format 1: single bitmask line — extract the first hex number and do bitwise AND
+    local bitmask
+    bitmask=$(echo "$raw" | head -1 | awk '{print $1}')
+    if [[ "$bitmask" =~ ^0x[0-9a-fA-F]+$ ]]; then
+        local result=$(( bitmask & etype ))
+        [[ $result -ne 0 ]] && return 0
+    fi
     return 1
 }
 
@@ -139,6 +156,18 @@ cpu_apicid() {
 #
 # All params are optional; only written if non-empty. The error_inject
 # trigger is always written last.
+# Write a value to an EINJ sysfs file, suppressing and reporting errors.
+# Some kernels/BIOS don't support SET_ERROR_TYPE_WITH_ADDRESS, so writes
+# to flags/param* may fail with EINVAL. We report but don't abort.
+_einj_write() {
+    local file=$1 val=$2 label=$3
+    if ! echo "$val" > "$file" 2>/dev/null; then
+        echo "  [WARN] write $label=$val to $file failed (BIOS may not support SET_ERROR_TYPE_WITH_ADDRESS)"
+        return 1
+    fi
+    return 0
+}
+
 einj_inject() {
     local etype=$1
     local flags=${2:-}
@@ -148,11 +177,11 @@ einj_inject() {
     local param4=${6:-}
 
     echo "$etype" > $EINJ_DIR/error_type
-    [[ -n "$flags"  && -f $EINJ_DIR/flags  ]] && echo "$flags"  > $EINJ_DIR/flags
-    [[ -n "$param1" && -f $EINJ_DIR/param1 ]] && echo "$param1" > $EINJ_DIR/param1
-    [[ -n "$param2" && -f $EINJ_DIR/param2 ]] && echo "$param2" > $EINJ_DIR/param2
-    [[ -n "$param3" && -f $EINJ_DIR/param3 ]] && echo "$param3" > $EINJ_DIR/param3
-    [[ -n "$param4" && -f $EINJ_DIR/param4 ]] && echo "$param4" > $EINJ_DIR/param4
+    [[ -n "$flags"  && -f $EINJ_DIR/flags  ]] && _einj_write $EINJ_DIR/flags  "$flags"  "flags"
+    [[ -n "$param1" && -f $EINJ_DIR/param1 ]] && _einj_write $EINJ_DIR/param1 "$param1" "param1"
+    [[ -n "$param2" && -f $EINJ_DIR/param2 ]] && _einj_write $EINJ_DIR/param2 "$param2" "param2"
+    [[ -n "$param3" && -f $EINJ_DIR/param3 ]] && _einj_write $EINJ_DIR/param3 "$param3" "param3"
+    [[ -n "$param4" && -f $EINJ_DIR/param4 ]] && _einj_write $EINJ_DIR/param4 "$param4" "param4"
 
     echo 1 > $EINJ_DIR/error_inject
     local rc=$?
@@ -179,18 +208,37 @@ einj_inject_mem() {
 # Processor error injection with CPU targeting via APIC ID.
 # Usage: einj_inject_proc <error_type_hex> <cpu_number>
 #
-# Sets flags=0x1 (APIC valid), param3=APIC_ID.
-# Requires param3 support in kernel (4.17+).
+# Tries SET_ERROR_TYPE_WITH_ADDRESS (flags=0x1, param3=APIC_ID).
+# Falls back to plain injection if param3/flags aren't supported.
+#
+# On kernels / BIOS that don't support SET_ERROR_TYPE_WITH_ADDRESS,
+# the firmware picks which CPU gets the error. To improve targeting
+# on such platforms, we pin the current shell to the target CPU via
+# taskset before injecting — the firmware's default is often to
+# inject on the requesting CPU.
 einj_inject_proc() {
     local etype=$1 cpu=$2
     local apicid
     apicid=$(cpu_apicid "$cpu")
+
+    # Check if APIC-targeted injection is available
     if [[ ! -f $EINJ_DIR/param3 ]]; then
-        echo "  [WARN] $EINJ_DIR/param3 not available — injecting without APIC targeting"
-        echo "  (error will hit whichever CPU the firmware chooses)"
-        einj_inject "$etype" "" "" "" "" ""
-        return $?
+        echo "  [INFO] param3 not available — using taskset pinning for CPU targeting"
+        taskset -c "$cpu" bash -c "echo $etype > $EINJ_DIR/error_type && echo 1 > $EINJ_DIR/error_inject"
+        local rc=$?
+        echo "  injected (EINJ, taskset cpu$cpu): type=$(printf '0x%08x' "$etype")  [rc=$rc]"
+        return $rc
     fi
+
+    # Try APIC-targeted path; if flags write fails, fall back to taskset
+    if ! _einj_write $EINJ_DIR/flags "$EINJ_FLAG_PROC_APIC_VALID" "flags" 2>/dev/null; then
+        echo "  [INFO] SET_ERROR_TYPE_WITH_ADDRESS not supported — using taskset pinning"
+        taskset -c "$cpu" bash -c "echo $etype > $EINJ_DIR/error_type && echo 1 > $EINJ_DIR/error_inject"
+        local rc=$?
+        echo "  injected (EINJ, taskset cpu$cpu): type=$(printf '0x%08x' "$etype")  [rc=$rc]"
+        return $rc
+    fi
+
     einj_inject "$etype" "$EINJ_FLAG_PROC_APIC_VALID" "" "" "$apicid" ""
 }
 

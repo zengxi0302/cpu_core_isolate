@@ -44,3 +44,12 @@ printf "    %-26s: %s -> %s\n" "cfi ce_count" "$CE0" "$CE1"
 printf "    %-26s: %s -> %s\n" "online"       "$ON0" "$ON1"
 echo "    dmesg (relevant):"
 dmesg_digest | sed 's/^/      /'
+
+if ! dmesg_since_mark | grep -qE 'Hardware Error|GHES|mce|corrected|cpu_fault_isolate'; then
+    echo
+    echo "  [INFO] No kernel-side trace for Processor CE injection."
+    echo "  On FMA platforms, processor CE may be consumed by firmware."
+    echo "  Without SET_ERROR_TYPE_WITH_ADDRESS support, CPU targeting"
+    echo "  relies on taskset pinning — the error may have hit a"
+    echo "  different CPU than cpu$TC."
+fi

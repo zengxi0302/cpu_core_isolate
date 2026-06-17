@@ -66,6 +66,16 @@ printf "    %-26s: %s -> %s\n" "cfi error_types" "$TY0" "$TY1"
 echo "    dmesg (relevant):"
 dmesg_digest | sed 's/^/      /'
 
+if ! dmesg_since_mark | grep -qE 'Hardware Error|GHES|mce|uncorrected|cpu_fault_isolate|machine check'; then
+    echo
+    echo "  [INFO] No kernel-side trace for Processor UCE non-fatal injection."
+    echo "  Possible causes:"
+    echo "    - FMA firmware consumed the error before kernel MCE handler"
+    echo "    - BIOS doesn't support SET_ERROR_TYPE_WITH_ADDRESS (APIC targeting)"
+    echo "    - Processor UCE injection not actually delivered on this platform"
+    echo "  Workaround: use mce-inject cases 04/13 for CPU isolation demo"
+fi
+
 # Scheduler-exclusion check (inactive-mode signature).
 if cfi_loaded && [[ "$ST1" == "isolated" ]]; then
     echo
