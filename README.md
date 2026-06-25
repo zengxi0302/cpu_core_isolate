@@ -7,6 +7,8 @@
 
 - **CFI（CPU 域）**：Cache UCE / 软硬锁 → panic 抑制 + 故障核 offline +
   netlink 通知上层迁移 VM。设计见 `docs/design-document.md`。
+  各类 UCE 的内核默认行为与 CFI 加载收益对照见
+  `docs/uce-coverage-matrix.md`。
 - **MFI（内存域）**：页级 CE 预隔离（soft offline）、异步 UCE 页隔离、
   DIMM 介质记账、内核态 UCE 落点甄别（Phase 2，灰度开关）。
   设计见 `docs/memory-fault-isolation-design.md`。
